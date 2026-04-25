@@ -7052,9 +7052,7 @@ HWND WindowFromPoint(POINT p)
   return NULL;
 }
 
-#ifdef _DEBUG
 int g_swell_in_paint;
-#endif
 
 BOOL InvalidateRect(HWND hwnd, const RECT *r, int eraseBk)
 { 
