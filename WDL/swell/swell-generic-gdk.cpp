@@ -1407,6 +1407,18 @@ static void OnKeyEvent(GdkEventKey *k)
 
   if (is_extended) modifiers |= 1<<24;
 
+  if (msgtype == WM_KEYDOWN && (modifiers & ~(1<<24)) == (FVIRTKEY|FALT|FSHIFT) &&
+      (kv == VK_LEFT || kv == VK_RIGHT || kv == VK_UP || kv == VK_DOWN))
+  {
+    swell_accesskit_listview_info info;
+    if (swell_accesskit_get_listview_info(hwnd,&info) && info.is_report)
+    {
+      // Work around Orca table navigation on X11: Orca uses Alt+Shift+Arrow
+      // for table navigation, but these commands can still leak to apps.
+      return;
+    }
+  }
+
   MSG msg = { hwnd, msgtype, kv, modifiers, };
   INT_PTR extra_flags = 0;
   if (DialogBoxIsActive()) extra_flags |= 1;
