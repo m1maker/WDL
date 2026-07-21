@@ -182,6 +182,7 @@ typedef struct {
   AtkObject parent;
   HWND hwnd;         // Retain()ed for the wrapper's lifetime, so the pointer stays valid after destroy
   gchar *name_cache; // owned storage backing get_name()
+  GHashTable *item_cache; // virtual items keyed by index+1 or HTREEITEM (containers only)
 } SwellAtkBase;
 typedef struct { AtkObjectClass parent; } SwellAtkBaseClass;
 
@@ -370,6 +371,11 @@ static void swell_atk_base_finalize(GObject *o)
   if (b->hwnd) { b->hwnd->Release(); b->hwnd = NULL; }
   g_free(b->name_cache);
   b->name_cache = NULL;
+  if (b->item_cache)
+  {
+    g_hash_table_destroy(b->item_cache);
+    b->item_cache = NULL;
+  }
   G_OBJECT_CLASS(swell_atk_base_parent_class)->finalize(o);
 }
 
@@ -391,6 +397,7 @@ static void swell_atk_base_init(SwellAtkBase *b)
 {
   b->hwnd = NULL;
   b->name_cache = NULL;
+  b->item_cache = NULL;
 }
 
 /////////////// AtkComponent (geometry, hit testing, focus grab)
@@ -478,6 +485,381 @@ static void swell_atk_component_iface_init(AtkComponentIface *iface)
   iface->get_extents = swell_atk_component_get_extents;
   iface->ref_accessible_at_point = swell_atk_component_ref_accessible_at_point;
   iface->grab_focus = swell_atk_component_grab_focus;
+}
+
+/////////////// virtual items (list rows, tree items, tabs, combo entries)
+
+#define SWELL_TYPE_ATK_ITEM (swell_atk_item_get_type())
+#define SWELL_ATK_ITEM(o) (G_TYPE_CHECK_INSTANCE_CAST((o),SWELL_TYPE_ATK_ITEM,SwellAtkItem))
+#define SWELL_IS_ATK_ITEM(o) (G_TYPE_CHECK_INSTANCE_TYPE((o),SWELL_TYPE_ATK_ITEM))
+
+typedef struct {
+  AtkObject parent;
+  SwellAtkBase *container; // strong ref; liveness of the item follows container->hwnd
+  int index;               // index-keyed containers (list/tab/combo); -1 for tree items
+  HTREEITEM hti;           // tree items only, validated against the live tree before use
+  gchar *name_cache;
+} SwellAtkItem;
+typedef struct { AtkObjectClass parent; } SwellAtkItemClass;
+
+static bool tree_desc_contains(HTREEITEM par, HTREEITEM needle)
+{
+  for (int i = 0; i < par->m_children.GetSize(); i ++)
+  {
+    HTREEITEM c = par->m_children.Get(i);
+    if (c == needle || tree_desc_contains(c,needle)) return true;
+  }
+  return false;
+}
+
+static bool tree_item_valid(HWND h, HTREEITEM it)
+{
+  if (!it) return false;
+  HTREEITEM r = TreeView_GetRoot(h);
+  while (r)
+  {
+    if (r == it || tree_desc_contains(r,it)) return true;
+    r = TreeView_GetNextSibling(h,r);
+  }
+  return false;
+}
+
+static int cont_item_count(HWND h)
+{
+  switch (classifyHwnd(h))
+  {
+    case WT_LISTBOX: return (int)SendMessage(h,LB_GETCOUNT,0,0);
+    case WT_LISTVIEW: return ListView_GetItemCount(h);
+    case WT_TAB: return TabCtrl_GetItemCount(h);
+    case WT_COMBO: return (int)SendMessage(h,CB_GETCOUNT,0,0);
+    case WT_TREEVIEW:
+      {
+        int n = 0;
+        HTREEITEM r = TreeView_GetRoot(h);
+        while (r) { n++; r = TreeView_GetNextSibling(h,r); }
+        return n;
+      }
+  }
+  return 0;
+}
+
+// container hwnd if the item is still usable, otherwise NULL
+static HWND item_hwnd(SwellAtkItem *it)
+{
+  if (!it->container) return NULL;
+  HWND h = swell_atk_hwnd((AtkObject *)it->container);
+  if (!h) return NULL;
+  if (it->hti) return tree_item_valid(h,it->hti) ? h : NULL;
+  return it->index >= 0 && it->index < cont_item_count(h) ? h : NULL;
+}
+
+static bool item_is_selected(SwellAtkItem *it)
+{
+  HWND h = item_hwnd(it);
+  if (!h) return false;
+  switch (classifyHwnd(h))
+  {
+    case WT_LISTBOX: return SendMessage(h,LB_GETSEL,it->index,0) > 0 ||
+                            (int)SendMessage(h,LB_GETCURSEL,0,0) == it->index;
+    case WT_LISTVIEW: return (ListView_GetItemState(h,it->index,LVIS_SELECTED) & LVIS_SELECTED) != 0;
+    case WT_TREEVIEW: return TreeView_GetSelection(h) == it->hti;
+    case WT_TAB: return TabCtrl_GetCurSel(h) == it->index;
+    case WT_COMBO: return (int)SendMessage(h,CB_GETCURSEL,0,0) == it->index;
+  }
+  return false;
+}
+
+static void item_select(SwellAtkItem *it)
+{
+  HWND h = item_hwnd(it);
+  if (!h) return;
+  switch (classifyHwnd(h))
+  {
+    case WT_LISTBOX:
+      SendMessage(h,LB_SETCURSEL,it->index,0);
+      if (h->m_parent) SendMessage(h->m_parent,WM_COMMAND,MAKEWPARAM(h->m_id,LBN_SELCHANGE),(LPARAM)h);
+    break;
+    case WT_LISTVIEW:
+      ListView_SetItemState(h,it->index,LVIS_SELECTED|LVIS_FOCUSED,LVIS_SELECTED|LVIS_FOCUSED);
+      ListView_EnsureVisible(h,it->index,FALSE);
+    break;
+    case WT_TREEVIEW: TreeView_SelectItem(h,it->hti); break;
+    case WT_TAB:
+      TabCtrl_SetCurSel(h,it->index);
+      if (h->m_parent)
+      {
+        NMHDR nm = { h, (UINT_PTR)h->m_id, TCN_SELCHANGE };
+        SendMessage(h->m_parent,WM_NOTIFY,h->m_id,(LPARAM)&nm);
+      }
+    break;
+    case WT_COMBO:
+      SendMessage(h,CB_SETCURSEL,it->index,0);
+      if (h->m_parent) SendMessage(h->m_parent,WM_COMMAND,MAKEWPARAM(h->m_id,CBN_SELCHANGE),(LPARAM)h);
+    break;
+  }
+}
+
+static void item_get_name(SwellAtkItem *it, WDL_FastString *out)
+{
+  out->Set("");
+  HWND h = item_hwnd(it);
+  if (!h) return;
+  char buf[4096];
+  switch (classifyHwnd(h))
+  {
+    case WT_LISTBOX:
+      buf[0] = 0;
+      SendMessage(h,LB_GETTEXT,it->index,(LPARAM)buf);
+      out->Set(buf);
+    break;
+    case WT_LISTVIEW:
+      {
+        int nc = swell_atspi_get_listview_ncols(h);
+        if (nc < 1) nc = 1;
+        for (int c = 0; c < nc; c ++)
+        {
+          buf[0] = 0;
+          ListView_GetItemText(h,it->index,c,buf,sizeof(buf));
+          if (buf[0])
+          {
+            if (out->GetLength()) out->Append(", ");
+            out->Append(buf);
+          }
+        }
+      }
+    break;
+    case WT_TREEVIEW:
+      if (it->hti->m_value) out->Set(it->hti->m_value);
+    break;
+    case WT_TAB:
+      if (swell_atspi_get_tab_text(h,it->index,buf,sizeof(buf))) out->Set(buf);
+    break;
+    case WT_COMBO:
+      buf[0] = 0;
+      SendMessage(h,CB_GETLBTEXT,it->index,(LPARAM)buf);
+      out->Set(buf);
+    break;
+  }
+}
+
+static AtkObject *swell_atk_container_get_item(SwellAtkBase *cont, int index, HTREEITEM hti);
+static void swell_atk_item_component_iface_init(AtkComponentIface *iface);
+static void swell_atk_item_action_iface_init(AtkActionIface *iface);
+
+G_DEFINE_TYPE_WITH_CODE(SwellAtkItem, swell_atk_item, ATK_TYPE_OBJECT,
+    G_IMPLEMENT_INTERFACE(ATK_TYPE_COMPONENT, swell_atk_item_component_iface_init)
+    G_IMPLEMENT_INTERFACE(ATK_TYPE_ACTION, swell_atk_item_action_iface_init))
+
+static const gchar *swell_atk_item_get_name(AtkObject *o)
+{
+  SwellAtkItem *it = SWELL_ATK_ITEM(o);
+  WDL_FastString s;
+  item_get_name(it,&s);
+  g_free(it->name_cache);
+  it->name_cache = g_strdup(s.Get());
+  return it->name_cache;
+}
+
+static AtkRole swell_atk_item_get_role(AtkObject *o)
+{
+  SwellAtkItem *it = SWELL_ATK_ITEM(o);
+  HWND h = item_hwnd(it);
+  if (!h) return ATK_ROLE_INVALID;
+  switch (classifyHwnd(h))
+  {
+    case WT_TREEVIEW: return ATK_ROLE_TREE_ITEM;
+    case WT_TAB: return ATK_ROLE_PAGE_TAB;
+  }
+  return ATK_ROLE_LIST_ITEM;
+}
+
+static AtkStateSet *swell_atk_item_ref_state_set(AtkObject *o)
+{
+  AtkStateSet *ss = ATK_OBJECT_CLASS(swell_atk_item_parent_class)->ref_state_set(o);
+  SwellAtkItem *it = SWELL_ATK_ITEM(o);
+  HWND h = item_hwnd(it);
+  if (!h)
+  {
+    atk_state_set_add_state(ss,ATK_STATE_DEFUNCT);
+    return ss;
+  }
+  atk_state_set_add_state(ss,ATK_STATE_SELECTABLE);
+  atk_state_set_add_state(ss,ATK_STATE_FOCUSABLE);
+  if (h->m_visible) atk_state_set_add_state(ss,ATK_STATE_VISIBLE);
+  if (IsWindowVisible(h)) atk_state_set_add_state(ss,ATK_STATE_SHOWING);
+  if (IsWindowEnabled(h))
+  {
+    atk_state_set_add_state(ss,ATK_STATE_ENABLED);
+    atk_state_set_add_state(ss,ATK_STATE_SENSITIVE);
+  }
+  if (item_is_selected(it))
+  {
+    atk_state_set_add_state(ss,ATK_STATE_SELECTED);
+    if (h == GetFocusIncludeMenus()) atk_state_set_add_state(ss,ATK_STATE_FOCUSED);
+  }
+  if (it->hti)
+  {
+    if (it->hti->m_haschildren || it->hti->m_children.GetSize())
+    {
+      atk_state_set_add_state(ss,ATK_STATE_EXPANDABLE);
+      if (it->hti->m_state & TVIS_EXPANDED) atk_state_set_add_state(ss,ATK_STATE_EXPANDED);
+    }
+  }
+  return ss;
+}
+
+static AtkObject *swell_atk_item_get_parent(AtkObject *o)
+{
+  SwellAtkItem *it = SWELL_ATK_ITEM(o);
+  if (!it->container) return NULL;
+  if (it->hti)
+  {
+    HWND h = item_hwnd(it);
+    HTREEITEM par = h ? TreeView_GetParent(h,it->hti) : NULL;
+    if (par) return swell_atk_container_get_item(it->container,-1,par);
+  }
+  return (AtkObject *)it->container;
+}
+
+static gint swell_atk_item_get_n_children(AtkObject *o)
+{
+  SwellAtkItem *it = SWELL_ATK_ITEM(o);
+  if (!it->hti) return 0;
+  return item_hwnd(it) ? it->hti->m_children.GetSize() : 0;
+}
+
+static AtkObject *swell_atk_item_ref_child(AtkObject *o, gint i)
+{
+  SwellAtkItem *it = SWELL_ATK_ITEM(o);
+  if (!it->hti || !item_hwnd(it)) return NULL;
+  HTREEITEM c = it->hti->m_children.Get(i);
+  if (!c) return NULL;
+  AtkObject *co = swell_atk_container_get_item(it->container,-1,c);
+  if (co) g_object_ref(co);
+  return co;
+}
+
+static gint swell_atk_item_get_index_in_parent(AtkObject *o)
+{
+  SwellAtkItem *it = SWELL_ATK_ITEM(o);
+  HWND h = item_hwnd(it);
+  if (!h) return -1;
+  if (!it->hti) return it->index;
+  HTREEITEM par = TreeView_GetParent(h,it->hti);
+  if (par) return par->m_children.Find(it->hti);
+  int idx = 0;
+  HTREEITEM r = TreeView_GetRoot(h);
+  while (r && r != it->hti) { idx++; r = TreeView_GetNextSibling(h,r); }
+  return r ? idx : -1;
+}
+
+static void swell_atk_item_finalize(GObject *o)
+{
+  SwellAtkItem *it = SWELL_ATK_ITEM(o);
+  if (it->container) { g_object_unref(it->container); it->container = NULL; }
+  g_free(it->name_cache);
+  it->name_cache = NULL;
+  G_OBJECT_CLASS(swell_atk_item_parent_class)->finalize(o);
+}
+
+static void swell_atk_item_get_extents(AtkComponent *c, gint *x, gint *y,
+                                       gint *w, gint *hh, AtkCoordType ct)
+{
+  if (x) *x = 0;
+  if (y) *y = 0;
+  if (w) *w = 0;
+  if (hh) *hh = 0;
+  SwellAtkItem *it = SWELL_ATK_ITEM(c);
+  HWND h = item_hwnd(it);
+  if (!h || it->hti) return;
+  const int wt = classifyHwnd(h);
+  if (wt != WT_LISTVIEW && wt != WT_LISTBOX) return;
+  RECT r;
+  if (!ListView_GetItemRect(h,it->index,&r,LVIR_BOUNDS)) return;
+  gint cx, cy, cw, chh;
+  swell_atk_component_get_extents((AtkComponent *)it->container,&cx,&cy,&cw,&chh,ct);
+  if (x) *x = cx + r.left;
+  if (y) *y = cy + r.top;
+  if (w) *w = r.right - r.left;
+  if (hh) *hh = r.bottom - r.top;
+}
+
+static gboolean swell_atk_item_grab_focus(AtkComponent *c)
+{
+  SwellAtkItem *it = SWELL_ATK_ITEM(c);
+  HWND h = item_hwnd(it);
+  if (!h) return FALSE;
+  SetFocus(h);
+  item_select(it);
+  return TRUE;
+}
+
+static void swell_atk_item_component_iface_init(AtkComponentIface *iface)
+{
+  iface->get_extents = swell_atk_item_get_extents;
+  iface->grab_focus = swell_atk_item_grab_focus;
+}
+
+static gboolean swell_atk_item_do_action(AtkAction *a, gint i)
+{
+  SwellAtkItem *it = SWELL_ATK_ITEM(a);
+  if (i != 0 || !item_hwnd(it)) return FALSE;
+  item_select(it);
+  return TRUE;
+}
+
+static gint swell_atk_item_get_n_actions(AtkAction *a) { return 1; }
+static const gchar *swell_atk_item_get_action_name(AtkAction *a, gint i)
+{
+  return i == 0 ? "click" : NULL;
+}
+
+static void swell_atk_item_action_iface_init(AtkActionIface *iface)
+{
+  iface->do_action = swell_atk_item_do_action;
+  iface->get_n_actions = swell_atk_item_get_n_actions;
+  iface->get_name = swell_atk_item_get_action_name;
+}
+
+static void swell_atk_item_class_init(SwellAtkItemClass *klass)
+{
+  AtkObjectClass *oc = ATK_OBJECT_CLASS(klass);
+  oc->get_name = swell_atk_item_get_name;
+  oc->get_role = swell_atk_item_get_role;
+  oc->ref_state_set = swell_atk_item_ref_state_set;
+  oc->get_parent = swell_atk_item_get_parent;
+  oc->get_n_children = swell_atk_item_get_n_children;
+  oc->ref_child = swell_atk_item_ref_child;
+  oc->get_index_in_parent = swell_atk_item_get_index_in_parent;
+  G_OBJECT_CLASS(klass)->finalize = swell_atk_item_finalize;
+}
+
+static void swell_atk_item_init(SwellAtkItem *it)
+{
+  it->container = NULL;
+  it->index = -1;
+  it->hti = NULL;
+  it->name_cache = NULL;
+}
+
+// items are cached on the container wrapper so the same (index/htreeitem)
+// always resolves to the same AtkObject while the container lives
+static AtkObject *swell_atk_container_get_item(SwellAtkBase *cont, int index, HTREEITEM hti)
+{
+  if (!cont) return NULL;
+  if (!cont->item_cache)
+    cont->item_cache = g_hash_table_new_full(NULL,NULL,NULL,g_object_unref);
+  gpointer key = hti ? (gpointer)hti : GINT_TO_POINTER(index + 1);
+  SwellAtkItem *it = (SwellAtkItem *)g_hash_table_lookup(cont->item_cache,key);
+  if (!it)
+  {
+    it = (SwellAtkItem *)g_object_new(SWELL_TYPE_ATK_ITEM,NULL);
+    it->container = (SwellAtkBase *)g_object_ref(cont);
+    it->index = index;
+    it->hti = hti;
+    g_hash_table_insert(cont->item_cache,key,it); // cache owns this ref
+  }
+  return (AtkObject *)it;
 }
 
 /////////////// top level windows (frames/dialogs)
@@ -1067,11 +1449,135 @@ static void swell_atk_editable_text_iface_init(AtkEditableTextIface *iface)
 
 /////////////// combo boxes
 
+/////////////// shared container child/selection plumbing (list-likes + combo)
+
+static gint swell_atk_container_get_n_children(AtkObject *o)
+{
+  HWND h = swell_atk_hwnd(o);
+  return h ? cont_item_count(h) : 0;
+}
+
+static AtkObject *swell_atk_container_ref_child(AtkObject *o, gint i)
+{
+  HWND h = swell_atk_hwnd(o);
+  if (!h || i < 0 || i >= cont_item_count(h)) return NULL;
+  AtkObject *c;
+  if (classifyHwnd(h) == WT_TREEVIEW)
+  {
+    HTREEITEM r = TreeView_GetRoot(h);
+    while (r && i-- > 0) r = TreeView_GetNextSibling(h,r);
+    c = r ? swell_atk_container_get_item(SWELL_ATK_BASE(o),-1,r) : NULL;
+  }
+  else c = swell_atk_container_get_item(SWELL_ATK_BASE(o),i,NULL);
+  if (c) g_object_ref(c);
+  return c;
+}
+
+// current "cursor" item of a container, or NULL
+static AtkObject *swell_atk_container_current_item(HWND h)
+{
+  if (!h || !h->m_atspi) return NULL;
+  SwellAtkBase *cont = SWELL_ATK_BASE((AtkObject *)h->m_atspi);
+  switch (classifyHwnd(h))
+  {
+    case WT_LISTBOX:
+      {
+        const int i = (int)SendMessage(h,LB_GETCURSEL,0,0);
+        return i >= 0 ? swell_atk_container_get_item(cont,i,NULL) : NULL;
+      }
+    case WT_LISTVIEW:
+      {
+        const int n = ListView_GetItemCount(h);
+        for (int i = 0; i < n; i ++)
+          if (ListView_GetItemState(h,i,LVIS_FOCUSED|LVIS_SELECTED))
+            return swell_atk_container_get_item(cont,i,NULL);
+        return NULL;
+      }
+    case WT_TREEVIEW:
+      {
+        HTREEITEM sel = TreeView_GetSelection(h);
+        return sel ? swell_atk_container_get_item(cont,-1,sel) : NULL;
+      }
+    case WT_TAB:
+      {
+        const int i = TabCtrl_GetCurSel(h);
+        return i >= 0 && i < TabCtrl_GetItemCount(h) ? swell_atk_container_get_item(cont,i,NULL) : NULL;
+      }
+    case WT_COMBO:
+      {
+        const int i = (int)SendMessage(h,CB_GETCURSEL,0,0);
+        return i >= 0 ? swell_atk_container_get_item(cont,i,NULL) : NULL;
+      }
+  }
+  return NULL;
+}
+
+static gint swell_atk_sel_get_selection_count(AtkSelection *s)
+{
+  HWND h = swell_atk_hwnd((AtkObject *)s);
+  if (!h) return 0;
+  if (classifyHwnd(h) == WT_LISTVIEW) return ListView_GetSelectedCount(h);
+  return swell_atk_container_current_item(h) ? 1 : 0;
+}
+
+static AtkObject *swell_atk_sel_ref_selection(AtkSelection *s, gint i)
+{
+  HWND h = swell_atk_hwnd((AtkObject *)s);
+  if (!h) return NULL;
+  if (classifyHwnd(h) == WT_LISTVIEW)
+  {
+    const int n = ListView_GetItemCount(h);
+    for (int x = 0; x < n; x ++)
+      if (ListView_GetItemState(h,x,LVIS_SELECTED) && i-- == 0)
+      {
+        AtkObject *c = swell_atk_container_get_item(SWELL_ATK_BASE(s),x,NULL);
+        if (c) g_object_ref(c);
+        return c;
+      }
+    return NULL;
+  }
+  if (i != 0) return NULL;
+  AtkObject *c = swell_atk_container_current_item(h);
+  if (c) g_object_ref(c);
+  return c;
+}
+
+static gboolean swell_atk_sel_is_child_selected(AtkSelection *s, gint i)
+{
+  HWND h = swell_atk_hwnd((AtkObject *)s);
+  if (!h || i < 0 || i >= cont_item_count(h)) return FALSE;
+  AtkObject *c = swell_atk_container_ref_child((AtkObject *)s,i);
+  if (!c) return FALSE;
+  const gboolean r = item_is_selected(SWELL_ATK_ITEM(c));
+  g_object_unref(c);
+  return r;
+}
+
+static gboolean swell_atk_sel_add_selection(AtkSelection *s, gint i)
+{
+  AtkObject *c = swell_atk_container_ref_child((AtkObject *)s,i);
+  if (!c) return FALSE;
+  item_select(SWELL_ATK_ITEM(c));
+  g_object_unref(c);
+  return TRUE;
+}
+
+static void swell_atk_selection_iface_init(AtkSelectionIface *iface)
+{
+  iface->get_selection_count = swell_atk_sel_get_selection_count;
+  iface->ref_selection = swell_atk_sel_ref_selection;
+  iface->is_child_selected = swell_atk_sel_is_child_selected;
+  iface->add_selection = swell_atk_sel_add_selection;
+}
+
+/////////////// combo boxes
+
 #define SWELL_TYPE_ATK_COMBO (swell_atk_combo_get_type())
 typedef struct { SwellAtkBase parent; } SwellAtkCombo;
 typedef struct { SwellAtkBaseClass parent; } SwellAtkComboClass;
 
-G_DEFINE_TYPE(SwellAtkCombo, swell_atk_combo, SWELL_TYPE_ATK_BASE)
+G_DEFINE_TYPE_WITH_CODE(SwellAtkCombo, swell_atk_combo, SWELL_TYPE_ATK_BASE,
+    G_IMPLEMENT_INTERFACE(ATK_TYPE_SELECTION, swell_atk_selection_iface_init))
 
 static AtkRole swell_atk_combo_get_role(AtkObject *o)
 {
@@ -1080,7 +1586,10 @@ static AtkRole swell_atk_combo_get_role(AtkObject *o)
 
 static void swell_atk_combo_class_init(SwellAtkComboClass *klass)
 {
-  ATK_OBJECT_CLASS(klass)->get_role = swell_atk_combo_get_role;
+  AtkObjectClass *oc = ATK_OBJECT_CLASS(klass);
+  oc->get_role = swell_atk_combo_get_role;
+  oc->get_n_children = swell_atk_container_get_n_children;
+  oc->ref_child = swell_atk_container_ref_child;
 }
 static void swell_atk_combo_init(SwellAtkCombo *c) { }
 
@@ -1090,7 +1599,8 @@ static void swell_atk_combo_init(SwellAtkCombo *c) { }
 typedef struct { SwellAtkBase parent; } SwellAtkList;
 typedef struct { SwellAtkBaseClass parent; } SwellAtkListClass;
 
-G_DEFINE_TYPE(SwellAtkList, swell_atk_list, SWELL_TYPE_ATK_BASE)
+G_DEFINE_TYPE_WITH_CODE(SwellAtkList, swell_atk_list, SWELL_TYPE_ATK_BASE,
+    G_IMPLEMENT_INTERFACE(ATK_TYPE_SELECTION, swell_atk_selection_iface_init))
 
 static AtkRole swell_atk_list_get_role(AtkObject *o)
 {
@@ -1106,7 +1616,10 @@ static AtkRole swell_atk_list_get_role(AtkObject *o)
 
 static void swell_atk_list_class_init(SwellAtkListClass *klass)
 {
-  ATK_OBJECT_CLASS(klass)->get_role = swell_atk_list_get_role;
+  AtkObjectClass *oc = ATK_OBJECT_CLASS(klass);
+  oc->get_role = swell_atk_list_get_role;
+  oc->get_n_children = swell_atk_container_get_n_children;
+  oc->ref_child = swell_atk_container_ref_child;
 }
 static void swell_atk_list_init(SwellAtkList *l) { }
 
@@ -1229,6 +1742,19 @@ static AtkObject *s_active_frame;
 // last object that got a focused=TRUE notification, so FALSE can be paired to it
 static AtkObject *s_focus_obj;
 
+static bool focus_obj_live(AtkObject *o)
+{
+  if (SWELL_IS_ATK_ITEM(o)) return item_hwnd(SWELL_ATK_ITEM(o)) != NULL;
+  return swell_atk_hwnd(o) != NULL;
+}
+
+// true if o is a virtual item belonging to container hwnd h
+static bool is_item_of(AtkObject *o, HWND h)
+{
+  return o && SWELL_IS_ATK_ITEM(o) && SWELL_ATK_ITEM(o)->container &&
+         SWELL_ATK_ITEM(o)->container->hwnd == h;
+}
+
 static void set_focus_obj(AtkObject *o)
 {
   if (o == s_focus_obj) return;
@@ -1236,7 +1762,7 @@ static void set_focus_obj(AtkObject *o)
   {
     AtkObject *old = s_focus_obj;
     s_focus_obj = NULL;
-    if (swell_atk_hwnd(old))
+    if (focus_obj_live(old))
       atk_object_notify_state_change(old,ATK_STATE_FOCUSED,FALSE);
     g_object_unref(old);
   }
@@ -1280,10 +1806,11 @@ static void wrapper_notify_destroyed(HWND h)
     s_active_frame = NULL;
     g_object_unref(o);
   }
-  if (o == s_focus_obj)
+  if (o == s_focus_obj || is_item_of(s_focus_obj,h))
   {
+    AtkObject *f = s_focus_obj;
     s_focus_obj = NULL;
-    g_object_unref(o);
+    g_object_unref(f);
   }
 
   if (!h->m_parent)
@@ -1365,11 +1892,14 @@ void swell_atspi_msg_post(HWND h, UINT m, WPARAM w, LPARAM l, LRESULT r)
         if (!wantWrapper(tl) || !wantWrapper(h)) break;
         AtkObject *frame = swell_atspi_wrapper(tl,true);
         if (frame) set_active_frame(frame);
-        set_focus_obj(swell_atspi_wrapper(h,true));
+        AtkObject *o = swell_atspi_wrapper(h,true);
+        AtkObject *item = swell_atk_container_current_item(h);
+        set_focus_obj(item ? item : o);
       }
     break;
     case WM_KILLFOCUS:
-      if (h->m_atspi && (AtkObject *)h->m_atspi == s_focus_obj)
+      if (s_focus_obj &&
+          ((AtkObject *)h->m_atspi == s_focus_obj || is_item_of(s_focus_obj,h)))
         set_focus_obj(NULL);
     break;
     case WM_DESTROY:
@@ -1399,9 +1929,17 @@ void swell_atspi_msg_post(HWND h, UINT m, WPARAM w, LPARAM l, LRESULT r)
           case EN_CHANGE:
             if (classifyHwnd(src) == WT_EDIT && src->m_atspi) swell_atk_edit_sync(src,true);
           break;
-          case CBN_SELCHANGE:
-            if (classifyHwnd(src) == WT_COMBO && src->m_atspi)
-              g_signal_emit_by_name((AtkObject *)src->m_atspi,"selection-changed");
+          case CBN_SELCHANGE: // note: LBN_SELCHANGE has the same value; distinguish by class
+            {
+              const int swt = classifyHwnd(src);
+              if ((swt == WT_COMBO || swt == WT_LISTBOX) && src->m_atspi)
+              {
+                g_signal_emit_by_name((AtkObject *)src->m_atspi,"selection-changed");
+                AtkObject *item = swell_atk_container_current_item(src);
+                if (item && src == GetFocusIncludeMenus()) set_focus_obj(item);
+                else if (item) atk_object_notify_state_change(item,ATK_STATE_SELECTED,TRUE);
+              }
+            }
           break;
         }
       }
@@ -1444,6 +1982,26 @@ void swell_atspi_msg_post(HWND h, UINT m, WPARAM w, LPARAM l, LRESULT r)
     case WM_HSCROLL:
       if (l && classifyHwnd((HWND)l) == WT_TRACKBAR && ((HWND)l)->m_atspi)
         notify_value_changed((HWND)l,w == SB_ENDSCROLL); // drag stream is throttled
+    break;
+    case WM_NOTIFY:
+      {
+        NMHDR *nm = (NMHDR *)l;
+        if (!nm || !nm->hwndFrom || !nm->hwndFrom->m_atspi) break;
+        HWND src = nm->hwndFrom;
+        switch (nm->code)
+        {
+          case LVN_ITEMCHANGED:
+          case TVN_SELCHANGED:
+          case TCN_SELCHANGE:
+            {
+              g_signal_emit_by_name((AtkObject *)src->m_atspi,"selection-changed");
+              AtkObject *item = swell_atk_container_current_item(src);
+              if (item && src == GetFocusIncludeMenus()) set_focus_obj(item);
+              else if (item) atk_object_notify_state_change(item,ATK_STATE_SELECTED,TRUE);
+            }
+          break;
+        }
+      }
     break;
   }
 }

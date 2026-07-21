@@ -8782,6 +8782,24 @@ void swell_atspi_get_edit_state(HWND hwnd, int *caret, int *sel1, int *sel2)
   if (sel1) *sel1 = es->sel1;
   if (sel2) *sel2 = es->sel2;
 }
+
+bool swell_atspi_get_tab_text(HWND hwnd, int idx, char *buf, int bufsz)
+{
+  if (buf && bufsz > 0) *buf = 0;
+  if (!hwnd || !hwnd->m_private_data || !hwnd->m_classname || strcmp(hwnd->m_classname,"SysTabControl32")) return false;
+  const tabControlState *s = (const tabControlState *)hwnd->m_private_data;
+  const char *t = s->m_tabs.Get(idx);
+  if (!t) return false;
+  if (buf) lstrcpyn_safe(buf,t,bufsz);
+  return true;
+}
+
+int swell_atspi_get_listview_ncols(HWND hwnd)
+{
+  if (!hwnd || !hwnd->m_private_data || !hwnd->m_classname || strcmp(hwnd->m_classname,"SysListView32")) return 0;
+  const listViewState *lvs = (const listViewState *)hwnd->m_private_data;
+  return lvs->m_cols.GetSize();
+}
 #endif
 
 #endif
