@@ -68,6 +68,110 @@ static HWND toplevelOf(HWND h)
   return h;
 }
 
+enum swellWidgetType {
+  WT_GENERIC = 0,
+  WT_TOPLEVEL,
+  WT_STATIC,
+  WT_GROUPBOX,
+  WT_PUSHBUTTON,
+  WT_CHECKBOX,
+  WT_RADIO,
+  WT_EDIT,
+  WT_COMBO,
+  WT_TRACKBAR,
+  WT_PROGRESS,
+  WT_LISTBOX,
+  WT_LISTVIEW,
+  WT_TREEVIEW,
+  WT_TAB
+};
+
+static int classifyHwnd(HWND h)
+{
+  if (!h) return WT_GENERIC;
+  if (!h->m_parent) return WT_TOPLEVEL;
+  const char *cn = h->m_classname ? h->m_classname : "";
+  if (!strcmp(cn,"Button"))
+  {
+    if (h->m_style & BS_GROUPBOX) return WT_GROUPBOX; // SWELL defines this as a high bit, not a low-nibble value
+    switch (h->m_style & 0xf)
+    {
+      case BS_AUTOCHECKBOX:
+      case BS_AUTO3STATE: return WT_CHECKBOX;
+      case BS_AUTORADIOBUTTON: return WT_RADIO;
+      default: return WT_PUSHBUTTON;
+    }
+  }
+  if (!strcmp(cn,"Static")) return WT_STATIC;
+  if (!strcmp(cn,"Edit")) return WT_EDIT;
+  if (!strcmp(cn,"combobox")) return WT_COMBO;
+  if (!strcmp(cn,"msctls_trackbar32") || !strcmp(cn,"REAPERhfader")) return WT_TRACKBAR;
+  if (!strcmp(cn,"msctls_progress32")) return WT_PROGRESS;
+  if (!strcmp(cn,"ListBox")) return WT_LISTBOX;
+  if (!strcmp(cn,"SysListView32")) return WT_LISTVIEW;
+  if (!strcmp(cn,"SysTreeView32")) return WT_TREEVIEW;
+  if (!strcmp(cn,"SysTabControl32")) return WT_TAB;
+  return WT_GENERIC;
+}
+
+// controls that take their accessible name from a preceding Static label
+static bool wantsLabelName(int wt)
+{
+  switch (wt)
+  {
+    case WT_EDIT:
+    case WT_COMBO:
+    case WT_TRACKBAR:
+    case WT_PROGRESS:
+    case WT_LISTBOX:
+    case WT_LISTVIEW:
+    case WT_TREEVIEW:
+    case WT_TAB:
+      return true;
+  }
+  return false;
+}
+
+static HWND findLabelFor(HWND h)
+{
+  if (!h || !wantsLabelName(classifyHwnd(h))) return NULL;
+  HWND w = h->m_prev;
+  while (w)
+  {
+    const int wt = classifyHwnd(w);
+    if (wt == WT_STATIC && w->m_title.GetLength()) return w;
+    w = w->m_prev;
+  }
+  return NULL;
+}
+
+static HWND findLabelTarget(HWND label) // inverse of findLabelFor
+{
+  if (classifyHwnd(label) != WT_STATIC || !label->m_title.GetLength()) return NULL;
+  HWND w = label->m_next;
+  while (w)
+  {
+    if (wantsLabelName(classifyHwnd(w))) return findLabelFor(w) == label ? w : NULL;
+    if (classifyHwnd(w) == WT_STATIC && w->m_title.GetLength()) return NULL;
+    w = w->m_next;
+  }
+  return NULL;
+}
+
+// strips '&' accelerator markers ("&&" emits a literal '&')
+static gchar *swell_atspi_strip_accel(const char *p)
+{
+  gchar *s = g_strdup(p ? p : ""), *r = s, *w = s;
+  while (*r)
+  {
+    if (*r == '&' && r[1] && r[1] != '&') { r++; continue; }
+    if (*r == '&' && r[1] == '&') r++;
+    *w++ = *r++;
+  }
+  *w = 0;
+  return s;
+}
+
 /////////////// base wrapper object (any HWND)
 
 #define SWELL_TYPE_ATK_BASE (swell_atk_base_get_type())
@@ -81,7 +185,10 @@ typedef struct {
 } SwellAtkBase;
 typedef struct { AtkObjectClass parent; } SwellAtkBaseClass;
 
-G_DEFINE_TYPE(SwellAtkBase, swell_atk_base, ATK_TYPE_OBJECT)
+static void swell_atk_component_iface_init(AtkComponentIface *iface);
+
+G_DEFINE_TYPE_WITH_CODE(SwellAtkBase, swell_atk_base, ATK_TYPE_OBJECT,
+    G_IMPLEMENT_INTERFACE(ATK_TYPE_COMPONENT, swell_atk_component_iface_init))
 
 static HWND swell_atk_hwnd(AtkObject *o)
 {
@@ -96,8 +203,14 @@ static const gchar *swell_atk_base_get_name(AtkObject *o)
   HWND h = swell_atk_hwnd(o);
   if (!h) return b->name_cache;
 
+  const char *src = h->m_title.Get();
+  if (wantsLabelName(classifyHwnd(h)))
+  {
+    HWND label = findLabelFor(h);
+    src = label ? label->m_title.Get() : "";
+  }
   g_free(b->name_cache);
-  b->name_cache = g_strdup(h->m_title.Get());
+  b->name_cache = swell_atspi_strip_accel(src);
   return b->name_cache;
 }
 
@@ -105,7 +218,36 @@ static AtkRole swell_atk_base_get_role(AtkObject *o)
 {
   HWND h = swell_atk_hwnd(o);
   if (!h) return ATK_ROLE_INVALID;
-  return ATK_ROLE_PANEL; // per-class roles arrive with the control wrappers
+  switch (classifyHwnd(h))
+  {
+    case WT_STATIC: return ATK_ROLE_LABEL;
+    case WT_GROUPBOX: return ATK_ROLE_PANEL;
+  }
+  return ATK_ROLE_PANEL;
+}
+
+static AtkRelationSet *swell_atk_base_ref_relation_set(AtkObject *o)
+{
+  AtkRelationSet *rs = ATK_OBJECT_CLASS(swell_atk_base_parent_class)->ref_relation_set(o);
+  HWND h = swell_atk_hwnd(o);
+  if (!h) return rs;
+
+  HWND label = findLabelFor(h);
+  if (label)
+  {
+    AtkObject *lo = swell_atspi_wrapper(label,true);
+    if (lo) atk_relation_set_add_relation_by_type(rs,ATK_RELATION_LABELLED_BY,lo);
+  }
+  else
+  {
+    HWND target = findLabelTarget(h);
+    if (target)
+    {
+      AtkObject *to = swell_atspi_wrapper(target,true);
+      if (to) atk_relation_set_add_relation_by_type(rs,ATK_RELATION_LABEL_FOR,to);
+    }
+  }
+  return rs;
 }
 
 static AtkStateSet *swell_atk_base_ref_state_set(AtkObject *o)
@@ -127,6 +269,23 @@ static AtkStateSet *swell_atk_base_ref_state_set(AtkObject *o)
   }
   if (h->m_wantfocus) atk_state_set_add_state(ss,ATK_STATE_FOCUSABLE);
   if (h == GetFocusIncludeMenus()) atk_state_set_add_state(ss,ATK_STATE_FOCUSED);
+
+  switch (classifyHwnd(h))
+  {
+    case WT_CHECKBOX:
+    case WT_RADIO:
+      {
+        const LRESULT chk = SendMessage(h,BM_GETCHECK,0,0);
+        if (chk == 1) atk_state_set_add_state(ss,ATK_STATE_CHECKED);
+        else if (chk == 2) atk_state_set_add_state(ss,ATK_STATE_INDETERMINATE);
+      }
+    break;
+    case WT_EDIT:
+      if (!(h->m_style & ES_READONLY)) atk_state_set_add_state(ss,ATK_STATE_EDITABLE);
+      atk_state_set_add_state(ss,(h->m_style & ES_MULTILINE) ?
+                              ATK_STATE_MULTI_LINE : ATK_STATE_SINGLE_LINE);
+    break;
+  }
 
   if (!h->m_parent)
   {
@@ -151,11 +310,33 @@ static AtkObject *swell_atk_base_get_parent(AtkObject *o)
 
 static gint swell_atk_base_get_n_children(AtkObject *o)
 {
-  return 0; // child descent lands with the control wrappers
+  HWND h = swell_atk_hwnd(o);
+  if (!h) return 0;
+  gint n = 0;
+  HWND w = h->m_children;
+  while (w)
+  {
+    if (wantWrapper(w)) n++;
+    w = w->m_next;
+  }
+  return n;
 }
 
 static AtkObject *swell_atk_base_ref_child(AtkObject *o, gint i)
 {
+  HWND h = swell_atk_hwnd(o);
+  if (!h) return NULL;
+  HWND w = h->m_children;
+  while (w)
+  {
+    if (wantWrapper(w) && i-- == 0)
+    {
+      AtkObject *c = swell_atspi_wrapper(w,true);
+      if (c) g_object_ref(c);
+      return c;
+    }
+    w = w->m_next;
+  }
   return NULL;
 }
 
@@ -202,6 +383,7 @@ static void swell_atk_base_class_init(SwellAtkBaseClass *klass)
   oc->get_n_children = swell_atk_base_get_n_children;
   oc->ref_child = swell_atk_base_ref_child;
   oc->get_index_in_parent = swell_atk_base_get_index_in_parent;
+  oc->ref_relation_set = swell_atk_base_ref_relation_set;
   G_OBJECT_CLASS(klass)->finalize = swell_atk_base_finalize;
 }
 
@@ -209,6 +391,93 @@ static void swell_atk_base_init(SwellAtkBase *b)
 {
   b->hwnd = NULL;
   b->name_cache = NULL;
+}
+
+/////////////// AtkComponent (geometry, hit testing, focus grab)
+
+static void swell_atk_component_get_extents(AtkComponent *c, gint *x, gint *y,
+                                            gint *w, gint *hh, AtkCoordType ct)
+{
+  if (x) *x = 0;
+  if (y) *y = 0;
+  if (w) *w = 0;
+  if (hh) *hh = 0;
+  HWND h = swell_atk_hwnd((AtkObject *)c);
+  if (!h) return;
+
+  // computed purely from SWELL's coordinate model (not the window manager's
+  // frame origin) so parent/child extents are always mutually consistent
+  POINT pt = { 0, 0 };
+  ClientToScreen(h,&pt);
+  RECT cr;
+  GetClientRect(h,&cr);
+  RECT r = { pt.x, pt.y, pt.x + cr.right, pt.y + cr.bottom };
+
+  if (ct == ATK_XY_WINDOW)
+  {
+    HWND tl = toplevelOf(h);
+    if (tl)
+    {
+      POINT tp = { 0, 0 };
+      ClientToScreen(tl,&tp);
+      r.left -= tp.x; r.right -= tp.x;
+      r.top -= tp.y; r.bottom -= tp.y;
+    }
+  }
+  if (x) *x = r.left;
+  if (y) *y = r.top;
+  if (w) *w = r.right - r.left;
+  if (hh) *hh = r.bottom - r.top;
+}
+
+static AtkObject *swell_atk_component_ref_accessible_at_point(AtkComponent *c,
+                                                              gint x, gint y, AtkCoordType ct)
+{
+  HWND h = swell_atk_hwnd((AtkObject *)c);
+  if (!h) return NULL;
+
+  gint ox, oy, ow, oh;
+  swell_atk_component_get_extents(c,&ox,&oy,&ow,&oh,ct);
+  if (x < ox || y < oy || x >= ox+ow || y >= oy+oh) return NULL;
+
+  HWND w = h->m_children;
+  while (w)
+  {
+    if (wantWrapper(w) && w->m_visible)
+    {
+      AtkObject *co = swell_atspi_wrapper(w,true);
+      if (co)
+      {
+        gint cx, cy, cw, ch;
+        swell_atk_component_get_extents((AtkComponent *)co,&cx,&cy,&cw,&ch,ct);
+        if (x >= cx && y >= cy && x < cx+cw && y < cy+ch)
+        {
+          AtkObject *sub = swell_atk_component_ref_accessible_at_point((AtkComponent *)co,x,y,ct);
+          if (sub) return sub;
+          g_object_ref(co);
+          return co;
+        }
+      }
+    }
+    w = w->m_next;
+  }
+  g_object_ref((AtkObject *)c);
+  return (AtkObject *)c;
+}
+
+static gboolean swell_atk_component_grab_focus(AtkComponent *c)
+{
+  HWND h = swell_atk_hwnd((AtkObject *)c);
+  if (!h || !h->m_wantfocus || !IsWindowEnabled(h)) return FALSE;
+  SetFocus(h);
+  return TRUE;
+}
+
+static void swell_atk_component_iface_init(AtkComponentIface *iface)
+{
+  iface->get_extents = swell_atk_component_get_extents;
+  iface->ref_accessible_at_point = swell_atk_component_ref_accessible_at_point;
+  iface->grab_focus = swell_atk_component_grab_focus;
 }
 
 /////////////// top level windows (frames/dialogs)
@@ -237,6 +506,121 @@ static void swell_atk_toplevel_class_init(SwellAtkTopLevelClass *klass)
 }
 
 static void swell_atk_toplevel_init(SwellAtkTopLevel *tl) { }
+
+/////////////// buttons (push/check/radio)
+
+#define SWELL_TYPE_ATK_BUTTON (swell_atk_button_get_type())
+typedef struct { SwellAtkBase parent; } SwellAtkButton;
+typedef struct { SwellAtkBaseClass parent; } SwellAtkButtonClass;
+
+G_DEFINE_TYPE(SwellAtkButton, swell_atk_button, SWELL_TYPE_ATK_BASE)
+
+static AtkRole swell_atk_button_get_role(AtkObject *o)
+{
+  switch (classifyHwnd(swell_atk_hwnd(o)))
+  {
+    case WT_CHECKBOX: return ATK_ROLE_CHECK_BOX;
+    case WT_RADIO: return ATK_ROLE_RADIO_BUTTON;
+    case WT_PUSHBUTTON: return ATK_ROLE_PUSH_BUTTON;
+  }
+  return ATK_ROLE_INVALID;
+}
+
+static void swell_atk_button_class_init(SwellAtkButtonClass *klass)
+{
+  ATK_OBJECT_CLASS(klass)->get_role = swell_atk_button_get_role;
+}
+static void swell_atk_button_init(SwellAtkButton *b) { }
+
+/////////////// value controls (trackbar/progress)
+
+#define SWELL_TYPE_ATK_VALUE (swell_atk_value_get_type())
+typedef struct { SwellAtkBase parent; } SwellAtkValue;
+typedef struct { SwellAtkBaseClass parent; } SwellAtkValueClass;
+
+G_DEFINE_TYPE(SwellAtkValue, swell_atk_value, SWELL_TYPE_ATK_BASE)
+
+static AtkRole swell_atk_value_get_role(AtkObject *o)
+{
+  switch (classifyHwnd(swell_atk_hwnd(o)))
+  {
+    case WT_TRACKBAR: return ATK_ROLE_SLIDER;
+    case WT_PROGRESS: return ATK_ROLE_PROGRESS_BAR;
+  }
+  return ATK_ROLE_INVALID;
+}
+
+static void swell_atk_value_class_init(SwellAtkValueClass *klass)
+{
+  ATK_OBJECT_CLASS(klass)->get_role = swell_atk_value_get_role;
+}
+static void swell_atk_value_init(SwellAtkValue *v) { }
+
+/////////////// edit controls
+
+#define SWELL_TYPE_ATK_EDIT (swell_atk_edit_get_type())
+typedef struct { SwellAtkBase parent; } SwellAtkEdit;
+typedef struct { SwellAtkBaseClass parent; } SwellAtkEditClass;
+
+G_DEFINE_TYPE(SwellAtkEdit, swell_atk_edit, SWELL_TYPE_ATK_BASE)
+
+static AtkRole swell_atk_edit_get_role(AtkObject *o)
+{
+  HWND h = swell_atk_hwnd(o);
+  if (!h) return ATK_ROLE_INVALID;
+  return (h->m_style & ES_PASSWORD) ? ATK_ROLE_PASSWORD_TEXT : ATK_ROLE_TEXT;
+}
+
+static void swell_atk_edit_class_init(SwellAtkEditClass *klass)
+{
+  ATK_OBJECT_CLASS(klass)->get_role = swell_atk_edit_get_role;
+}
+static void swell_atk_edit_init(SwellAtkEdit *e) { }
+
+/////////////// combo boxes
+
+#define SWELL_TYPE_ATK_COMBO (swell_atk_combo_get_type())
+typedef struct { SwellAtkBase parent; } SwellAtkCombo;
+typedef struct { SwellAtkBaseClass parent; } SwellAtkComboClass;
+
+G_DEFINE_TYPE(SwellAtkCombo, swell_atk_combo, SWELL_TYPE_ATK_BASE)
+
+static AtkRole swell_atk_combo_get_role(AtkObject *o)
+{
+  return swell_atk_hwnd(o) ? ATK_ROLE_COMBO_BOX : ATK_ROLE_INVALID;
+}
+
+static void swell_atk_combo_class_init(SwellAtkComboClass *klass)
+{
+  ATK_OBJECT_CLASS(klass)->get_role = swell_atk_combo_get_role;
+}
+static void swell_atk_combo_init(SwellAtkCombo *c) { }
+
+/////////////// list-like controls (listbox/listview/treeview/tab)
+
+#define SWELL_TYPE_ATK_LIST (swell_atk_list_get_type())
+typedef struct { SwellAtkBase parent; } SwellAtkList;
+typedef struct { SwellAtkBaseClass parent; } SwellAtkListClass;
+
+G_DEFINE_TYPE(SwellAtkList, swell_atk_list, SWELL_TYPE_ATK_BASE)
+
+static AtkRole swell_atk_list_get_role(AtkObject *o)
+{
+  switch (classifyHwnd(swell_atk_hwnd(o)))
+  {
+    case WT_LISTBOX: return ATK_ROLE_LIST_BOX;
+    case WT_LISTVIEW: return ATK_ROLE_TREE_TABLE;
+    case WT_TREEVIEW: return ATK_ROLE_TREE;
+    case WT_TAB: return ATK_ROLE_PAGE_TAB_LIST;
+  }
+  return ATK_ROLE_INVALID;
+}
+
+static void swell_atk_list_class_init(SwellAtkListClass *klass)
+{
+  ATK_OBJECT_CLASS(klass)->get_role = swell_atk_list_get_role;
+}
+static void swell_atk_list_init(SwellAtkList *l) { }
 
 /////////////// application root
 
@@ -325,9 +709,26 @@ AtkObject *swell_atspi_wrapper(HWND h, bool create)
   if (!h) return NULL;
   if (h->m_atspi) return (AtkObject *)h->m_atspi;
   if (!create || !wantWrapper(h)) return NULL;
-  if (h->m_parent) return NULL; // controls arrive in a later pass
 
-  SwellAtkBase *b = (SwellAtkBase *)g_object_new(SWELL_TYPE_ATK_TOPLEVEL,NULL);
+  GType t;
+  switch (classifyHwnd(h))
+  {
+    case WT_TOPLEVEL: t = SWELL_TYPE_ATK_TOPLEVEL; break;
+    case WT_PUSHBUTTON:
+    case WT_CHECKBOX:
+    case WT_RADIO: t = SWELL_TYPE_ATK_BUTTON; break;
+    case WT_TRACKBAR:
+    case WT_PROGRESS: t = SWELL_TYPE_ATK_VALUE; break;
+    case WT_EDIT: t = SWELL_TYPE_ATK_EDIT; break;
+    case WT_COMBO: t = SWELL_TYPE_ATK_COMBO; break;
+    case WT_LISTBOX:
+    case WT_LISTVIEW:
+    case WT_TREEVIEW:
+    case WT_TAB: t = SWELL_TYPE_ATK_LIST; break;
+    default: t = SWELL_TYPE_ATK_BASE; break;
+  }
+
+  SwellAtkBase *b = (SwellAtkBase *)g_object_new(t,NULL);
   h->Retain();
   b->hwnd = h;
   h->m_atspi = b;
@@ -336,6 +737,26 @@ AtkObject *swell_atspi_wrapper(HWND h, bool create)
 
 // current window-activation state, tracked so activate/deactivate pairs stay balanced
 static AtkObject *s_active_frame;
+// last object that got a focused=TRUE notification, so FALSE can be paired to it
+static AtkObject *s_focus_obj;
+
+static void set_focus_obj(AtkObject *o)
+{
+  if (o == s_focus_obj) return;
+  if (s_focus_obj)
+  {
+    AtkObject *old = s_focus_obj;
+    s_focus_obj = NULL;
+    if (swell_atk_hwnd(old))
+      atk_object_notify_state_change(old,ATK_STATE_FOCUSED,FALSE);
+    g_object_unref(old);
+  }
+  if (o)
+  {
+    s_focus_obj = (AtkObject *)g_object_ref(o);
+    atk_object_notify_state_change(o,ATK_STATE_FOCUSED,TRUE);
+  }
+}
 
 static void set_active_frame(AtkObject *frame)
 {
@@ -370,6 +791,11 @@ static void wrapper_notify_destroyed(HWND h)
     s_active_frame = NULL;
     g_object_unref(o);
   }
+  if (o == s_focus_obj)
+  {
+    s_focus_obj = NULL;
+    g_object_unref(o);
+  }
 
   if (!h->m_parent)
   {
@@ -398,12 +824,15 @@ void swell_atspi_msg_post(HWND h, UINT m, WPARAM w, LPARAM l, LRESULT r)
       {
         ATSPI_DEBUG("WM_SETFOCUS hwnd=%p class=%s\n",(void*)h,h->m_classname);
         HWND tl = toplevelOf(h);
-        if (!wantWrapper(tl)) break;
+        if (!wantWrapper(tl) || !wantWrapper(h)) break;
         AtkObject *frame = swell_atspi_wrapper(tl,true);
         if (frame) set_active_frame(frame);
-        if (h == tl && frame)
-          atk_object_notify_state_change(frame,ATK_STATE_FOCUSED,TRUE);
+        set_focus_obj(swell_atspi_wrapper(h,true));
       }
+    break;
+    case WM_KILLFOCUS:
+      if (h->m_atspi && (AtkObject *)h->m_atspi == s_focus_obj)
+        set_focus_obj(NULL);
     break;
     case WM_DESTROY:
       if (h->m_hashaddestroy == 2) wrapper_notify_destroyed(h);

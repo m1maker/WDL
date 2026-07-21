@@ -52,6 +52,77 @@ WDL_DLGRET mainProc(HWND hwndDlg, UINT uMsg, WPARAM wParam, LPARAM lParam)
 
       resize.init(hwndDlg);
       resize.init_item(IDCANCEL,0,1,0,1);
+
+      {
+        // populate the demo controls
+        HWND combo = GetDlgItem(hwndDlg,IDC_COMBO1);
+        SendMessage(combo,CB_ADDSTRING,0,(LPARAM)"Apple");
+        SendMessage(combo,CB_ADDSTRING,0,(LPARAM)"Banana");
+        SendMessage(combo,CB_ADDSTRING,0,(LPARAM)"Cherry");
+        SendMessage(combo,CB_SETCURSEL,0,0);
+
+        HWND list = GetDlgItem(hwndDlg,IDC_LIST1);
+        SendMessage(list,LB_ADDSTRING,0,(LPARAM)"First item");
+        SendMessage(list,LB_ADDSTRING,0,(LPARAM)"Second item");
+        SendMessage(list,LB_ADDSTRING,0,(LPARAM)"Third item");
+        SendMessage(list,LB_SETCURSEL,0,0);
+
+        HWND slider = GetDlgItem(hwndDlg,IDC_SLIDER1);
+        SendMessage(slider,TBM_SETRANGE,0,MAKELONG(0,100));
+        SendMessage(slider,TBM_SETPOS,1,42);
+
+        HWND progress = GetDlgItem(hwndDlg,IDC_PROGRESS1);
+        SendMessage(progress,PBM_SETRANGE,0,MAKELONG(0,100));
+        SendMessage(progress,PBM_SETPOS,66,0);
+
+        HWND lv = GetDlgItem(hwndDlg,IDC_LISTVIEW1);
+        LVCOLUMN col;
+        memset(&col,0,sizeof(col));
+        col.mask = LVCF_TEXT|LVCF_WIDTH;
+        col.cx = 120;
+        col.pszText = (char*)"File";
+        ListView_InsertColumn(lv,0,&col);
+        col.pszText = (char*)"Size";
+        col.cx = 60;
+        ListView_InsertColumn(lv,1,&col);
+        for (int i = 0; i < 3; i ++)
+        {
+          char tmp[64];
+          snprintf(tmp,sizeof(tmp),"file%d.wav",i+1);
+          LVITEM item;
+          memset(&item,0,sizeof(item));
+          item.mask = LVIF_TEXT;
+          item.iItem = i;
+          item.pszText = tmp;
+          ListView_InsertItem(lv,&item);
+          snprintf(tmp,sizeof(tmp),"%d kb",(i+1)*100);
+          ListView_SetItemText(lv,i,1,tmp);
+        }
+
+        HWND tree = GetDlgItem(hwndDlg,IDC_TREE1);
+        TVINSERTSTRUCT tvis;
+        memset(&tvis,0,sizeof(tvis));
+        tvis.item.mask = TVIF_TEXT;
+        tvis.item.pszText = (char*)"Fruits";
+        HTREEITEM root1 = TreeView_InsertItem(tree,&tvis);
+        tvis.hParent = root1;
+        tvis.item.pszText = (char*)"Apple";
+        TreeView_InsertItem(tree,&tvis);
+        tvis.item.pszText = (char*)"Banana";
+        TreeView_InsertItem(tree,&tvis);
+        tvis.hParent = NULL;
+        tvis.item.pszText = (char*)"Vegetables";
+        TreeView_InsertItem(tree,&tvis);
+
+        HWND tab = GetDlgItem(hwndDlg,IDC_TAB1);
+        TCITEM tci;
+        memset(&tci,0,sizeof(tci));
+        tci.mask = TCIF_TEXT;
+        tci.pszText = (char*)"General";
+        TabCtrl_InsertItem(tab,0,&tci);
+        tci.pszText = (char*)"Advanced";
+        TabCtrl_InsertItem(tab,1,&tci);
+      }
     return 1;
     case WM_CLOSE:
       DestroyWindow(hwndDlg);
