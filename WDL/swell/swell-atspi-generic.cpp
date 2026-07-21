@@ -632,9 +632,21 @@ static void item_get_name(SwellAtkItem *it, WDL_FastString *out)
   switch (classifyHwnd(h))
   {
     case WT_LISTBOX:
-      buf[0] = 0;
-      SendMessage(h,LB_GETTEXT,it->index,(LPARAM)buf);
-      out->Set(buf);
+      {
+        // LB_GETTEXT copies unbounded; size the buffer via LB_GETTEXTLEN first
+        const int len = (int)SendMessage(h,LB_GETTEXTLEN,it->index,0);
+        if (len > 0)
+        {
+          char *p = (char *)malloc(len + 32);
+          if (p)
+          {
+            p[0] = 0;
+            SendMessage(h,LB_GETTEXT,it->index,(LPARAM)p);
+            out->Set(p);
+            free(p);
+          }
+        }
+      }
     break;
     case WT_LISTVIEW:
       {
@@ -659,9 +671,21 @@ static void item_get_name(SwellAtkItem *it, WDL_FastString *out)
       if (swell_atspi_get_tab_text(h,it->index,buf,sizeof(buf))) out->Set(buf);
     break;
     case WT_COMBO:
-      buf[0] = 0;
-      SendMessage(h,CB_GETLBTEXT,it->index,(LPARAM)buf);
-      out->Set(buf);
+      {
+        // CB_GETLBTEXT copies unbounded; size the buffer via CB_GETLBTEXTLEN first
+        const int len = (int)SendMessage(h,CB_GETLBTEXTLEN,it->index,0);
+        if (len > 0)
+        {
+          char *p = (char *)malloc(len + 32);
+          if (p)
+          {
+            p[0] = 0;
+            SendMessage(h,CB_GETLBTEXT,it->index,(LPARAM)p);
+            out->Set(p);
+            free(p);
+          }
+        }
+      }
     break;
     case WT_MENU:
       {
@@ -1330,6 +1354,8 @@ static gboolean swell_atk_text_set_caret_offset(AtkText *t, gint offset)
   HWND h = swell_atk_hwnd((AtkObject *)t);
   if (!h) return FALSE;
   SendMessage(h,EM_SETSEL,offset,offset);
+  swell_atspi_set_edit_caret(h,offset);
+  swell_atk_edit_sync(h,true);
   return TRUE;
 }
 
@@ -1490,7 +1516,10 @@ static void swell_atk_edtext_insert_text(AtkEditableText *t, const gchar *s, gin
   gchar *seg = len >= 0 ? g_strndup(s,len) : g_strdup(s);
   SendMessage(h,EM_SETSEL,p,p);
   SendMessage(h,EM_REPLACESEL,TRUE,(LPARAM)seg);
-  if (pos) *pos = p + (gint)g_utf8_strlen(seg,-1);
+  const gint newpos = p + (gint)g_utf8_strlen(seg,-1);
+  if (pos) *pos = newpos;
+  swell_atspi_set_edit_caret(h,newpos);
+  swell_atk_edit_sync(h,true);
   g_free(seg);
 }
 
@@ -1846,12 +1875,13 @@ static void set_focus_obj(AtkObject *o)
 static void set_active_frame(AtkObject *frame)
 {
   if (frame == s_active_frame) return;
+  if (frame && !ATK_IS_WINDOW(frame)) return; // e.g. a wrapper created pre-reparenting
   ATSPI_DEBUG("set_active_frame %p -> %p\n",(void*)s_active_frame,(void*)frame);
   if (s_active_frame)
   {
     AtkObject *old = s_active_frame;
     s_active_frame = NULL;
-    if (swell_atk_hwnd(old)) // skip the signal on defunct objects
+    if (swell_atk_hwnd(old) && ATK_IS_WINDOW(old)) // skip the signal on defunct objects
     {
       g_signal_emit_by_name(old,"deactivate");
       atk_object_notify_state_change(old,ATK_STATE_ACTIVE,FALSE);
@@ -1892,6 +1922,18 @@ static void wrapper_notify_destroyed(HWND h)
   }
   atk_object_notify_state_change(o,ATK_STATE_DEFUNCT,TRUE);
 
+  if (SWELL_IS_ATK_BASE(o))
+  {
+    // break the item->container reference cycle, or the wrapper (and its
+    // Retain()ed HWND) would leak once any virtual item was created
+    SwellAtkBase *b = SWELL_ATK_BASE(o);
+    if (b->item_cache)
+    {
+      g_hash_table_destroy(b->item_cache);
+      b->item_cache = NULL;
+    }
+  }
+
   h->m_atspi = NULL;
   g_object_unref(o); // drop the HWND's owned ref; ATs may keep the wrapper alive
 }
@@ -1925,6 +1967,19 @@ static void notify_radio_group(HWND h)
       nw = x ? nw->m_next : nw->m_prev;
     }
   }
+}
+
+// apps may send WM_COMMAND/WM_HSCROLL with arbitrary non-HWND lParam values;
+// only pointers found in the receiver's descendant tree are ever dereferenced
+static bool is_descendant_hwnd(HWND par, HWND cand)
+{
+  HWND w = par ? par->m_children : NULL;
+  while (w)
+  {
+    if (w == cand || is_descendant_hwnd(w,cand)) return true;
+    w = w->m_next;
+  }
+  return false;
 }
 
 // announces the highlighted menu item when a menu's sel_vis moved
@@ -2003,7 +2058,7 @@ void swell_atspi_msg_post(HWND h, UINT m, WPARAM w, LPARAM l, LRESULT r)
       }
     break;
     case WM_COMMAND:
-      if (l)
+      if (l && is_descendant_hwnd(h,(HWND)l))
       {
         HWND src = (HWND)l;
         switch (HIWORD(w))
@@ -2074,13 +2129,15 @@ void swell_atspi_msg_post(HWND h, UINT m, WPARAM w, LPARAM l, LRESULT r)
       if (h->m_atspi) notify_value_changed(h,true);
     break;
     case WM_HSCROLL:
-      if (l && classifyHwnd((HWND)l) == WT_TRACKBAR && ((HWND)l)->m_atspi)
+      if (l && is_descendant_hwnd(h,(HWND)l) &&
+          classifyHwnd((HWND)l) == WT_TRACKBAR && ((HWND)l)->m_atspi)
         notify_value_changed((HWND)l,w == SB_ENDSCROLL); // drag stream is throttled
     break;
     case WM_NOTIFY:
       {
         NMHDR *nm = (NMHDR *)l;
-        if (!nm || !nm->hwndFrom || !nm->hwndFrom->m_atspi) break;
+        if (!nm || !nm->hwndFrom || !is_descendant_hwnd(h,nm->hwndFrom) ||
+            !nm->hwndFrom->m_atspi) break;
         HWND src = nm->hwndFrom;
         switch (nm->code)
         {
@@ -2154,7 +2211,8 @@ void swell_atspi_app_active(int active)
     return;
   }
   HWND h = swell_oswindow_to_hwnd(SWELL_focused_oswindow);
-  if (wantWrapper(h)) set_active_frame(swell_atspi_wrapper(h,true));
+  if (wantWrapper(h) && classifyHwnd(h) != WT_MENU)
+    set_active_frame(swell_atspi_wrapper(h,true));
 }
 
 // AT key event listeners (registered by atk-bridge; enables Orca key echo

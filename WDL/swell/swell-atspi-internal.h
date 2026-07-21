@@ -40,6 +40,7 @@ bool swell_atspi_on_key(void *gdkEventKey); // returns true if the event was con
 
 // private-state accessors implemented in swell-wnd-generic.cpp
 void swell_atspi_get_edit_state(HWND hwnd, int *caret, int *sel1, int *sel2);
+void swell_atspi_set_edit_caret(HWND hwnd, int pos);
 bool swell_atspi_get_tab_text(HWND hwnd, int idx, char *buf, int bufsz);
 int swell_atspi_get_listview_ncols(HWND hwnd);
 

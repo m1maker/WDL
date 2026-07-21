@@ -8802,6 +8802,21 @@ int swell_atspi_get_listview_ncols(HWND hwnd)
   const listViewState *lvs = (const listViewState *)hwnd->m_private_data;
   return lvs->m_cols.GetSize();
 }
+
+void swell_atspi_set_edit_caret(HWND hwnd, int pos)
+{
+  // EM_SETSEL only adjusts the selection; the caret used for typing and
+  // reported by swell_atspi_get_edit_state is cursor_pos
+  if (!hwnd || !hwnd->m_private_data || !hwnd->m_classname || strcmp(hwnd->m_classname,"Edit")) return;
+  __SWELL_editControlState *es = (__SWELL_editControlState *)hwnd->m_private_data;
+  const int len = WDL_utf8_get_charlen(hwnd->m_title.Get());
+  if (pos < 0) pos = 0;
+  if (pos > len) pos = len;
+  es->cursor_pos = pos;
+  es->autoScrollToOffset(hwnd,pos,(hwnd->m_style & ES_MULTILINE) != 0,
+      (hwnd->m_style & (ES_MULTILINE|ES_AUTOHSCROLL)) == ES_MULTILINE);
+  InvalidateRect(hwnd,NULL,FALSE);
+}
 #endif
 
 #endif

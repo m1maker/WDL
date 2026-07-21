@@ -135,7 +135,7 @@ BEGIN
             VALUE "FileDescription", "swell_myapp\0"
             VALUE "FileVersion", "0, 0, 0, 1\0"
             VALUE "InternalName", "swell_myapp\0"
-            VALUE "LegalCopyright", "Copyright ï¿½ 2022 and onwards\0"
+            VALUE "LegalCopyright", "Copyright © 2022 and onwards\0"
             VALUE "LegalTrademarks", "\0"
             VALUE "OriginalFilename", "MyApp.exe\0"
             VALUE "PrivateBuild", "\0"

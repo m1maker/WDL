@@ -1,0 +1,5 @@
+*.o
+libSwell.so
+sample_project/myapp
+sample_project/res.rc_mac_dlg
+sample_project/res.rc_mac_menu
