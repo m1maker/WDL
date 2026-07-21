@@ -513,7 +513,33 @@ static void swell_atk_toplevel_init(SwellAtkTopLevel *tl) { }
 typedef struct { SwellAtkBase parent; } SwellAtkButton;
 typedef struct { SwellAtkBaseClass parent; } SwellAtkButtonClass;
 
-G_DEFINE_TYPE(SwellAtkButton, swell_atk_button, SWELL_TYPE_ATK_BASE)
+static gboolean swell_atk_button_do_action(AtkAction *a, gint i)
+{
+  HWND h = swell_atk_hwnd((AtkObject *)a);
+  if (!h || i != 0 || !IsWindowEnabled(h)) return FALSE;
+  SendMessage(h,WM_KEYDOWN,VK_SPACE,0); // drives the real click path, including BN_CLICKED
+  return TRUE;
+}
+
+static gint swell_atk_button_get_n_actions(AtkAction *a)
+{
+  return 1;
+}
+
+static const gchar *swell_atk_button_get_action_name(AtkAction *a, gint i)
+{
+  return i == 0 ? "press" : NULL;
+}
+
+static void swell_atk_action_iface_init(AtkActionIface *iface)
+{
+  iface->do_action = swell_atk_button_do_action;
+  iface->get_n_actions = swell_atk_button_get_n_actions;
+  iface->get_name = swell_atk_button_get_action_name;
+}
+
+G_DEFINE_TYPE_WITH_CODE(SwellAtkButton, swell_atk_button, SWELL_TYPE_ATK_BASE,
+    G_IMPLEMENT_INTERFACE(ATK_TYPE_ACTION, swell_atk_action_iface_init))
 
 static AtkRole swell_atk_button_get_role(AtkObject *o)
 {
@@ -812,8 +838,57 @@ static void wrapper_notify_destroyed(HWND h)
 
 /////////////// hooks called from swell-wnd-generic.cpp / swell-generic-gdk.cpp
 
+static void notify_check_state(HWND h)
+{
+  AtkObject *o = swell_atspi_wrapper(h,false);
+  if (!o) return;
+  const LRESULT chk = SendMessage(h,BM_GETCHECK,0,0);
+  atk_object_notify_state_change(o,ATK_STATE_CHECKED,chk == 1);
+  if (classifyHwnd(h) == WT_CHECKBOX)
+    atk_object_notify_state_change(o,ATK_STATE_INDETERMINATE,chk == 2);
+}
+
+// a radio click untoggles its group siblings without any observable message,
+// so refresh the whole run (same traversal as buttonWindowProc's radio logic)
+static void notify_radio_group(HWND h)
+{
+  notify_check_state(h);
+  for (int x = 0; x < 2; x ++)
+  {
+    HWND nw = x ? h->m_next : h->m_prev;
+    while (nw)
+    {
+      if (classifyHwnd(nw) != WT_RADIO) break;
+      if (x && (nw->m_style & WS_GROUP)) break;
+      notify_check_state(nw);
+      if (nw->m_style & WS_GROUP) break;
+      nw = x ? nw->m_next : nw->m_prev;
+    }
+  }
+}
+
+// PRE/POST pairs are strictly nested, so snapshots live on a small stack
+static struct { HWND h; UINT msg; LRESULT val; } s_snap[16];
+static int s_snap_depth;
+
 void swell_atspi_msg_pre(HWND h, UINT m, WPARAM w, LPARAM l)
 {
+  switch (m)
+  {
+    case BM_SETCHECK:
+      {
+        const int wt = classifyHwnd(h);
+        if ((wt == WT_CHECKBOX || wt == WT_RADIO) && h->m_atspi &&
+            s_snap_depth < (int) (sizeof(s_snap)/sizeof(s_snap[0])))
+        {
+          s_snap[s_snap_depth].h = h;
+          s_snap[s_snap_depth].msg = m;
+          s_snap[s_snap_depth].val = SendMessage(h,BM_GETCHECK,0,0);
+          s_snap_depth++;
+        }
+      }
+    break;
+  }
 }
 
 void swell_atspi_msg_post(HWND h, UINT m, WPARAM w, LPARAM l, LRESULT r)
@@ -836,6 +911,38 @@ void swell_atspi_msg_post(HWND h, UINT m, WPARAM w, LPARAM l, LRESULT r)
     break;
     case WM_DESTROY:
       if (h->m_hashaddestroy == 2) wrapper_notify_destroyed(h);
+    break;
+    case BM_SETCHECK:
+      if (s_snap_depth > 0 && s_snap[s_snap_depth-1].h == h && s_snap[s_snap_depth-1].msg == m)
+      {
+        s_snap_depth--;
+        if (SendMessage(h,BM_GETCHECK,0,0) != s_snap[s_snap_depth].val)
+          notify_check_state(h);
+      }
+    break;
+    case WM_COMMAND:
+      if (l && HIWORD(w) == BN_CLICKED)
+      {
+        HWND src = (HWND)l;
+        switch (classifyHwnd(src))
+        {
+          case WT_CHECKBOX: notify_check_state(src); break;
+          case WT_RADIO: notify_radio_group(src); break;
+        }
+      }
+    break;
+    case WM_SETTEXT:
+      if (h->m_atspi)
+      {
+        switch (classifyHwnd(h))
+        {
+          case WT_EDIT: // name comes from the label; content changes are AtkText's job
+          break;
+          default:
+            g_object_notify(G_OBJECT(h->m_atspi),"accessible-name");
+          break;
+        }
+      }
     break;
   }
 }
