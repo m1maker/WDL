@@ -38,6 +38,9 @@ void swell_atspi_enable_window(HWND h);
 void swell_atspi_app_active(int active);
 bool swell_atspi_on_key(void *gdkEventKey); // returns true if the event was consumed by an AT
 
+// private-state accessors implemented in swell-wnd-generic.cpp
+void swell_atspi_get_edit_state(HWND hwnd, int *caret, int *sel1, int *sel2);
+
 #define SWELL_ATSPI_INIT() swell_atspi_init()
 #define SWELL_ATSPI_MSG_PRE(h,m,w,l) do { if (swell_atspi_active) swell_atspi_msg_pre(h,m,w,l); } while(0)
 #define SWELL_ATSPI_MSG_POST(h,m,w,l,r) do { if (swell_atspi_active) swell_atspi_msg_post(h,m,w,l,r); } while(0)

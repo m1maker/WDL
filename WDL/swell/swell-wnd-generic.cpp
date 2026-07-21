@@ -8768,4 +8768,20 @@ LRESULT SWELL_SendMouseMessage(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam
   return ret;
 }
 
+#ifdef SWELL_TARGET_ATSPI
+// private-state accessors for the accessibility bridge (swell-atspi-generic.cpp) --
+// these expose control internals that have no public message-based read-back
+void swell_atspi_get_edit_state(HWND hwnd, int *caret, int *sel1, int *sel2)
+{
+  if (caret) *caret = -1;
+  if (sel1) *sel1 = -1;
+  if (sel2) *sel2 = -1;
+  if (!hwnd || !hwnd->m_private_data || !hwnd->m_classname || strcmp(hwnd->m_classname,"Edit")) return;
+  const __SWELL_editControlState *es = (const __SWELL_editControlState *)hwnd->m_private_data;
+  if (caret) *caret = es->cursor_pos; // character position, not bytes
+  if (sel1) *sel1 = es->sel1;
+  if (sel2) *sel2 = es->sel2;
+}
+#endif
+
 #endif

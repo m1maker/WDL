@@ -561,10 +561,18 @@ static void swell_atk_button_init(SwellAtkButton *b) { }
 /////////////// value controls (trackbar/progress)
 
 #define SWELL_TYPE_ATK_VALUE (swell_atk_value_get_type())
-typedef struct { SwellAtkBase parent; } SwellAtkValue;
+#define SWELL_ATK_VALUE(o) (G_TYPE_CHECK_INSTANCE_CAST((o),SWELL_TYPE_ATK_VALUE,SwellAtkValue))
+typedef struct {
+  SwellAtkBase parent;
+  gint64 last_emit;   // monotonic us of last value-changed emission (drag throttling)
+  double last_value;  // last emitted value, to drop duplicate notifications
+} SwellAtkValue;
 typedef struct { SwellAtkBaseClass parent; } SwellAtkValueClass;
 
-G_DEFINE_TYPE(SwellAtkValue, swell_atk_value, SWELL_TYPE_ATK_BASE)
+static void swell_atk_value_iface_init(AtkValueIface *iface);
+
+G_DEFINE_TYPE_WITH_CODE(SwellAtkValue, swell_atk_value, SWELL_TYPE_ATK_BASE,
+    G_IMPLEMENT_INTERFACE(ATK_TYPE_VALUE, swell_atk_value_iface_init))
 
 static AtkRole swell_atk_value_get_role(AtkObject *o)
 {
@@ -580,15 +588,139 @@ static void swell_atk_value_class_init(SwellAtkValueClass *klass)
 {
   ATK_OBJECT_CLASS(klass)->get_role = swell_atk_value_get_role;
 }
-static void swell_atk_value_init(SwellAtkValue *v) { }
+static void swell_atk_value_init(SwellAtkValue *v)
+{
+  v->last_emit = 0;
+  v->last_value = -1e300;
+}
+
+// trackbar and progress state share the layout int[0]=pos,
+// int[1]=range packed as MAKELONG(min,max) -- see trackbarWindowProc/progressWindowProc
+static bool swell_atk_value_read(HWND h, double *cur, double *lo, double *hi)
+{
+  const int wt = classifyHwnd(h);
+  if ((wt != WT_TRACKBAR && wt != WT_PROGRESS) || !h->m_private_data) return false;
+  const int *state = (const int *)h->m_private_data;
+  if (cur) *cur = state[0];
+  if (lo) *lo = (short)LOWORD(state[1]);
+  if (hi) *hi = (short)HIWORD(state[1]);
+  return true;
+}
+
+static void swell_atk_value_get_value_and_text(AtkValue *v, gdouble *value, gchar **text)
+{
+  if (value) *value = 0;
+  if (text) *text = NULL;
+  double cur;
+  HWND h = swell_atk_hwnd((AtkObject *)v);
+  if (h && swell_atk_value_read(h,&cur,NULL,NULL) && value) *value = cur;
+}
+
+static AtkRange *swell_atk_value_get_range(AtkValue *v)
+{
+  double lo, hi;
+  HWND h = swell_atk_hwnd((AtkObject *)v);
+  if (!h || !swell_atk_value_read(h,NULL,&lo,&hi)) return NULL;
+  return atk_range_new(lo,hi,NULL);
+}
+
+static gdouble swell_atk_value_get_increment(AtkValue *v)
+{
+  return 1;
+}
+
+static void swell_atk_value_set_value(AtkValue *v, const gdouble value)
+{
+  HWND h = swell_atk_hwnd((AtkObject *)v);
+  if (!h || classifyHwnd(h) != WT_TRACKBAR || !IsWindowEnabled(h)) return;
+  double lo, hi;
+  if (!swell_atk_value_read(h,NULL,&lo,&hi)) return;
+  double nv = value;
+  if (nv < lo) nv = lo;
+  else if (nv > hi) nv = hi;
+  SendMessage(h,TBM_SETPOS,1,(LPARAM)(int)nv);
+  if (h->m_parent) SendMessage(h->m_parent,WM_HSCROLL,SB_ENDSCROLL,(LPARAM)h);
+}
+
+// legacy AtkValue API (some ATs still query it)
+static void swell_atk_value_get_current_value(AtkValue *v, GValue *gv)
+{
+  gdouble d = 0;
+  swell_atk_value_get_value_and_text(v,&d,NULL);
+  g_value_init(gv,G_TYPE_DOUBLE);
+  g_value_set_double(gv,d);
+}
+
+static void swell_atk_value_get_maximum_value(AtkValue *v, GValue *gv)
+{
+  double lo = 0, hi = 0;
+  HWND h = swell_atk_hwnd((AtkObject *)v);
+  if (h) swell_atk_value_read(h,NULL,&lo,&hi);
+  g_value_init(gv,G_TYPE_DOUBLE);
+  g_value_set_double(gv,hi);
+}
+
+static void swell_atk_value_get_minimum_value(AtkValue *v, GValue *gv)
+{
+  double lo = 0, hi = 0;
+  HWND h = swell_atk_hwnd((AtkObject *)v);
+  if (h) swell_atk_value_read(h,NULL,&lo,&hi);
+  g_value_init(gv,G_TYPE_DOUBLE);
+  g_value_set_double(gv,lo);
+}
+
+static gboolean swell_atk_value_set_current_value(AtkValue *v, const GValue *gv)
+{
+  if (!G_VALUE_HOLDS_DOUBLE(gv)) return FALSE;
+  swell_atk_value_set_value(v,g_value_get_double(gv));
+  return TRUE;
+}
+
+static void swell_atk_value_iface_init(AtkValueIface *iface)
+{
+  iface->get_value_and_text = swell_atk_value_get_value_and_text;
+  iface->get_range = swell_atk_value_get_range;
+  iface->get_increment = swell_atk_value_get_increment;
+  iface->set_value = swell_atk_value_set_value;
+  iface->get_current_value = swell_atk_value_get_current_value;
+  iface->get_maximum_value = swell_atk_value_get_maximum_value;
+  iface->get_minimum_value = swell_atk_value_get_minimum_value;
+  iface->set_current_value = swell_atk_value_set_current_value;
+}
+
+// emits value-changed, throttled during drags unless force is set
+static void notify_value_changed(HWND h, bool force)
+{
+  AtkObject *o = swell_atspi_wrapper(h,false);
+  if (!o || !G_TYPE_CHECK_INSTANCE_TYPE(o,SWELL_TYPE_ATK_VALUE)) return;
+  SwellAtkValue *v = SWELL_ATK_VALUE(o);
+  double cur;
+  if (!swell_atk_value_read(h,&cur,NULL,NULL) || cur == v->last_value) return;
+  const gint64 now = g_get_monotonic_time();
+  if (!force && now - v->last_emit < 50000) return;
+  v->last_emit = now;
+  v->last_value = cur;
+  g_object_notify(G_OBJECT(o),"accessible-value");
+}
 
 /////////////// edit controls
 
 #define SWELL_TYPE_ATK_EDIT (swell_atk_edit_get_type())
-typedef struct { SwellAtkBase parent; } SwellAtkEdit;
+#define SWELL_ATK_EDIT(o) (G_TYPE_CHECK_INSTANCE_CAST((o),SWELL_TYPE_ATK_EDIT,SwellAtkEdit))
+typedef struct {
+  SwellAtkBase parent;
+  // last-reported text state, diffed against on every observed change
+  gchar *tcache;
+  gint ccaret, csel1, csel2;
+} SwellAtkEdit;
 typedef struct { SwellAtkBaseClass parent; } SwellAtkEditClass;
 
-G_DEFINE_TYPE(SwellAtkEdit, swell_atk_edit, SWELL_TYPE_ATK_BASE)
+static void swell_atk_text_iface_init(AtkTextIface *iface);
+static void swell_atk_editable_text_iface_init(AtkEditableTextIface *iface);
+
+G_DEFINE_TYPE_WITH_CODE(SwellAtkEdit, swell_atk_edit, SWELL_TYPE_ATK_BASE,
+    G_IMPLEMENT_INTERFACE(ATK_TYPE_TEXT, swell_atk_text_iface_init)
+    G_IMPLEMENT_INTERFACE(ATK_TYPE_EDITABLE_TEXT, swell_atk_editable_text_iface_init))
 
 static AtkRole swell_atk_edit_get_role(AtkObject *o)
 {
@@ -597,11 +729,341 @@ static AtkRole swell_atk_edit_get_role(AtkObject *o)
   return (h->m_style & ES_PASSWORD) ? ATK_ROLE_PASSWORD_TEXT : ATK_ROLE_TEXT;
 }
 
+static void swell_atk_edit_finalize(GObject *o)
+{
+  g_free(SWELL_ATK_EDIT(o)->tcache);
+  SWELL_ATK_EDIT(o)->tcache = NULL;
+  G_OBJECT_CLASS(swell_atk_edit_parent_class)->finalize(o);
+}
+
 static void swell_atk_edit_class_init(SwellAtkEditClass *klass)
 {
   ATK_OBJECT_CLASS(klass)->get_role = swell_atk_edit_get_role;
+  G_OBJECT_CLASS(klass)->finalize = swell_atk_edit_finalize;
 }
-static void swell_atk_edit_init(SwellAtkEdit *e) { }
+
+static void swell_atk_edit_init(SwellAtkEdit *e)
+{
+  e->tcache = NULL;
+  e->ccaret = e->csel1 = e->csel2 = -1;
+}
+
+// current edit text as the AT should see it (password chars masked)
+static gchar *swell_atk_edit_read_text(HWND h)
+{
+  const char *t = h->m_title.Get();
+  if (h->m_style & ES_PASSWORD)
+    return g_strnfill(g_utf8_strlen(t,-1),'*');
+  return g_strdup(t);
+}
+
+static void swell_atk_edit_read_sel(HWND h, gint *caret, gint *s1, gint *s2)
+{
+  int c = -1, a = -1, b = -1;
+  swell_atspi_get_edit_state(h,&c,&a,&b);
+  if (a > b && b >= 0) { const int t = a; a = b; b = t; }
+  if (a < 0 || b < 0 || a == b) a = b = -1;
+  *caret = c >= 0 ? c : 0;
+  *s1 = a;
+  *s2 = b;
+}
+
+// diffs current state against the wrapper cache and emits text events
+static void swell_atk_edit_sync(HWND h, bool emit)
+{
+  AtkObject *o = swell_atspi_wrapper(h,false);
+  if (!o || !SWELL_IS_ATK_BASE(o) || !G_TYPE_CHECK_INSTANCE_TYPE(o,SWELL_TYPE_ATK_EDIT)) return;
+  SwellAtkEdit *e = SWELL_ATK_EDIT(o);
+
+  gchar *cur = swell_atk_edit_read_text(h);
+  gint caret, s1, s2;
+  swell_atk_edit_read_sel(h,&caret,&s1,&s2);
+
+  if (e->tcache && strcmp(cur,e->tcache))
+  {
+    if (emit)
+    {
+      const gchar *olds = e->tcache, *news = cur;
+      const glong oldlen = g_utf8_strlen(olds,-1), newlen = g_utf8_strlen(news,-1);
+      glong pre = 0;
+      const gchar *op = olds, *np = news;
+      while (*op && *np)
+      {
+        if (g_utf8_get_char(op) != g_utf8_get_char(np)) break;
+        op = g_utf8_next_char(op);
+        np = g_utf8_next_char(np);
+        pre++;
+      }
+      glong suf = 0;
+      {
+        const glong maxsuf = wdl_min(oldlen,newlen) - pre;
+        const gchar *oe = olds + strlen(olds), *ne = news + strlen(news);
+        while (suf < maxsuf)
+        {
+          const gchar *po = g_utf8_prev_char(oe), *pn = g_utf8_prev_char(ne);
+          if (g_utf8_get_char(po) != g_utf8_get_char(pn)) break;
+          oe = po; ne = pn;
+          suf++;
+        }
+      }
+      const glong ndel = oldlen - pre - suf, nins = newlen - pre - suf;
+      if (ndel > 0)
+      {
+        gchar *seg = g_utf8_substring(olds,pre,pre+ndel);
+        g_signal_emit_by_name(o,"text-remove",(gint)pre,(gint)ndel,seg);
+        g_free(seg);
+      }
+      if (nins > 0)
+      {
+        gchar *seg = g_utf8_substring(news,pre,pre+nins);
+        g_signal_emit_by_name(o,"text-insert",(gint)pre,(gint)nins,seg);
+        g_free(seg);
+      }
+    }
+    g_free(e->tcache);
+    e->tcache = cur;
+  }
+  else if (!e->tcache) e->tcache = cur;
+  else g_free(cur);
+
+  if (caret != e->ccaret)
+  {
+    e->ccaret = caret;
+    if (emit) g_signal_emit_by_name(o,"text-caret-moved",caret);
+  }
+  if (s1 != e->csel1 || s2 != e->csel2)
+  {
+    e->csel1 = s1;
+    e->csel2 = s2;
+    if (emit) g_signal_emit_by_name(o,"text-selection-changed");
+  }
+}
+
+/////////////// AtkText implementation
+
+static gchar *swell_atk_text_get_text(AtkText *t, gint start, gint end)
+{
+  HWND h = swell_atk_hwnd((AtkObject *)t);
+  if (!h) return NULL;
+  gchar *full = swell_atk_edit_read_text(h);
+  const glong len = g_utf8_strlen(full,-1);
+  if (start < 0) start = 0;
+  if (end < 0 || end > len) end = (gint)len;
+  gchar *r = start < end ? g_utf8_substring(full,start,end) : g_strdup("");
+  g_free(full);
+  return r;
+}
+
+static gint swell_atk_text_get_character_count(AtkText *t)
+{
+  HWND h = swell_atk_hwnd((AtkObject *)t);
+  return h ? (gint)g_utf8_strlen(h->m_title.Get(),-1) : 0;
+}
+
+static gunichar swell_atk_text_get_character_at_offset(AtkText *t, gint offset)
+{
+  HWND h = swell_atk_hwnd((AtkObject *)t);
+  if (!h || offset < 0) return 0;
+  gchar *full = swell_atk_edit_read_text(h);
+  gunichar r = 0;
+  if (offset < g_utf8_strlen(full,-1))
+    r = g_utf8_get_char(g_utf8_offset_to_pointer(full,offset));
+  g_free(full);
+  return r;
+}
+
+static gint swell_atk_text_get_caret_offset(AtkText *t)
+{
+  HWND h = swell_atk_hwnd((AtkObject *)t);
+  if (!h) return 0;
+  gint caret, s1, s2;
+  swell_atk_edit_read_sel(h,&caret,&s1,&s2);
+  return caret;
+}
+
+static gboolean swell_atk_text_set_caret_offset(AtkText *t, gint offset)
+{
+  HWND h = swell_atk_hwnd((AtkObject *)t);
+  if (!h) return FALSE;
+  SendMessage(h,EM_SETSEL,offset,offset);
+  return TRUE;
+}
+
+static gint swell_atk_text_get_n_selections(AtkText *t)
+{
+  HWND h = swell_atk_hwnd((AtkObject *)t);
+  if (!h) return 0;
+  gint caret, s1, s2;
+  swell_atk_edit_read_sel(h,&caret,&s1,&s2);
+  return s1 >= 0 ? 1 : 0;
+}
+
+static gchar *swell_atk_text_get_selection(AtkText *t, gint selnum, gint *start, gint *end)
+{
+  if (start) *start = 0;
+  if (end) *end = 0;
+  HWND h = swell_atk_hwnd((AtkObject *)t);
+  if (!h || selnum != 0) return NULL;
+  gint caret, s1, s2;
+  swell_atk_edit_read_sel(h,&caret,&s1,&s2);
+  if (s1 < 0) return NULL;
+  if (start) *start = s1;
+  if (end) *end = s2;
+  return swell_atk_text_get_text(t,s1,s2);
+}
+
+static gboolean swell_atk_text_set_selection(AtkText *t, gint selnum, gint start, gint end)
+{
+  HWND h = swell_atk_hwnd((AtkObject *)t);
+  if (!h || selnum != 0) return FALSE;
+  SendMessage(h,EM_SETSEL,start,end);
+  return TRUE;
+}
+
+static gboolean swell_atk_text_add_selection(AtkText *t, gint start, gint end)
+{
+  return swell_atk_text_set_selection(t,0,start,end);
+}
+
+static gboolean swell_atk_text_remove_selection(AtkText *t, gint selnum)
+{
+  HWND h = swell_atk_hwnd((AtkObject *)t);
+  if (!h || selnum != 0) return FALSE;
+  gint caret, s1, s2;
+  swell_atk_edit_read_sel(h,&caret,&s1,&s2);
+  SendMessage(h,EM_SETSEL,caret,caret);
+  return TRUE;
+}
+
+// computes [start,end) character bounds for char/word/line units around offset
+static void swell_atk_text_bounds(const gchar *full, gint offset, int unit, gint *start, gint *end)
+{
+  const glong len = g_utf8_strlen(full,-1);
+  if (offset < 0) offset = 0;
+  if (offset > len) offset = (gint)len;
+  gint s = offset, e = offset;
+  switch (unit)
+  {
+    case 0: // character
+      e = offset < len ? offset+1 : offset;
+    break;
+    case 1: // word: [start of word containing/before offset, start of next word)
+      {
+        while (s > 0)
+        {
+          const gunichar c = g_utf8_get_char(g_utf8_offset_to_pointer(full,s-1));
+          if (g_unichar_isspace(c)) break;
+          s--;
+        }
+        e = offset;
+        while (e < len && !g_unichar_isspace(g_utf8_get_char(g_utf8_offset_to_pointer(full,e)))) e++;
+        while (e < len && g_unichar_isspace(g_utf8_get_char(g_utf8_offset_to_pointer(full,e)))) e++;
+      }
+    break;
+    case 2: // line (buffer lines; word-wrap visual lines are not modeled)
+      {
+        while (s > 0 && g_utf8_get_char(g_utf8_offset_to_pointer(full,s-1)) != '\n') s--;
+        e = offset;
+        while (e < len && g_utf8_get_char(g_utf8_offset_to_pointer(full,e)) != '\n') e++;
+        if (e < len) e++; // include the newline
+      }
+    break;
+  }
+  *start = s;
+  *end = e;
+}
+
+static gchar *swell_atk_text_get_string_at_offset(AtkText *t, gint offset,
+    AtkTextGranularity granularity, gint *start, gint *end)
+{
+  if (start) *start = 0;
+  if (end) *end = 0;
+  HWND h = swell_atk_hwnd((AtkObject *)t);
+  if (!h) return NULL;
+  int unit;
+  switch (granularity)
+  {
+    case ATK_TEXT_GRANULARITY_CHAR: unit = 0; break;
+    case ATK_TEXT_GRANULARITY_WORD: unit = 1; break;
+    case ATK_TEXT_GRANULARITY_LINE:
+    case ATK_TEXT_GRANULARITY_SENTENCE:
+    case ATK_TEXT_GRANULARITY_PARAGRAPH: unit = 2; break;
+    default: return NULL;
+  }
+  gchar *full = swell_atk_edit_read_text(h);
+  gint s, e;
+  swell_atk_text_bounds(full,offset,unit,&s,&e);
+  gchar *r = g_utf8_substring(full,s,e);
+  g_free(full);
+  if (start) *start = s;
+  if (end) *end = e;
+  return r;
+}
+
+static gchar *swell_atk_text_get_text_at_offset(AtkText *t, gint offset,
+    AtkTextBoundary boundary, gint *start, gint *end)
+{
+  AtkTextGranularity g;
+  switch (boundary)
+  {
+    case ATK_TEXT_BOUNDARY_CHAR: g = ATK_TEXT_GRANULARITY_CHAR; break;
+    case ATK_TEXT_BOUNDARY_WORD_START:
+    case ATK_TEXT_BOUNDARY_WORD_END: g = ATK_TEXT_GRANULARITY_WORD; break;
+    default: g = ATK_TEXT_GRANULARITY_LINE; break;
+  }
+  return swell_atk_text_get_string_at_offset(t,offset,g,start,end);
+}
+
+static void swell_atk_text_iface_init(AtkTextIface *iface)
+{
+  iface->get_text = swell_atk_text_get_text;
+  iface->get_character_count = swell_atk_text_get_character_count;
+  iface->get_character_at_offset = swell_atk_text_get_character_at_offset;
+  iface->get_caret_offset = swell_atk_text_get_caret_offset;
+  iface->set_caret_offset = swell_atk_text_set_caret_offset;
+  iface->get_n_selections = swell_atk_text_get_n_selections;
+  iface->get_selection = swell_atk_text_get_selection;
+  iface->set_selection = swell_atk_text_set_selection;
+  iface->add_selection = swell_atk_text_add_selection;
+  iface->remove_selection = swell_atk_text_remove_selection;
+  iface->get_string_at_offset = swell_atk_text_get_string_at_offset;
+  iface->get_text_at_offset = swell_atk_text_get_text_at_offset;
+}
+
+/////////////// AtkEditableText implementation
+
+static void swell_atk_edtext_set_text_contents(AtkEditableText *t, const gchar *s)
+{
+  HWND h = swell_atk_hwnd((AtkObject *)t);
+  if (h && !(h->m_style & ES_READONLY)) SendMessage(h,WM_SETTEXT,0,(LPARAM)(s ? s : ""));
+}
+
+static void swell_atk_edtext_insert_text(AtkEditableText *t, const gchar *s, gint len, gint *pos)
+{
+  HWND h = swell_atk_hwnd((AtkObject *)t);
+  if (!h || (h->m_style & ES_READONLY) || !s) return;
+  const gint p = pos ? *pos : 0;
+  gchar *seg = len >= 0 ? g_strndup(s,len) : g_strdup(s);
+  SendMessage(h,EM_SETSEL,p,p);
+  SendMessage(h,EM_REPLACESEL,TRUE,(LPARAM)seg);
+  if (pos) *pos = p + (gint)g_utf8_strlen(seg,-1);
+  g_free(seg);
+}
+
+static void swell_atk_edtext_delete_text(AtkEditableText *t, gint start, gint end)
+{
+  HWND h = swell_atk_hwnd((AtkObject *)t);
+  if (!h || (h->m_style & ES_READONLY)) return;
+  SendMessage(h,EM_SETSEL,start,end);
+  SendMessage(h,EM_REPLACESEL,TRUE,(LPARAM)"");
+}
+
+static void swell_atk_editable_text_iface_init(AtkEditableTextIface *iface)
+{
+  iface->set_text_contents = swell_atk_edtext_set_text_contents;
+  iface->insert_text = swell_atk_edtext_insert_text;
+  iface->delete_text = swell_atk_edtext_delete_text;
+}
 
 /////////////// combo boxes
 
@@ -758,6 +1220,7 @@ AtkObject *swell_atspi_wrapper(HWND h, bool create)
   h->Retain();
   b->hwnd = h;
   h->m_atspi = b;
+  if (t == SWELL_TYPE_ATK_EDIT) swell_atk_edit_sync(h,false); // seed the text cache silently
   return (AtkObject *)b;
 }
 
@@ -921,15 +1384,29 @@ void swell_atspi_msg_post(HWND h, UINT m, WPARAM w, LPARAM l, LRESULT r)
       }
     break;
     case WM_COMMAND:
-      if (l && HIWORD(w) == BN_CLICKED)
+      if (l)
       {
         HWND src = (HWND)l;
-        switch (classifyHwnd(src))
+        switch (HIWORD(w))
         {
-          case WT_CHECKBOX: notify_check_state(src); break;
-          case WT_RADIO: notify_radio_group(src); break;
+          case BN_CLICKED:
+            switch (classifyHwnd(src))
+            {
+              case WT_CHECKBOX: notify_check_state(src); break;
+              case WT_RADIO: notify_radio_group(src); break;
+            }
+          break;
+          case EN_CHANGE:
+            if (classifyHwnd(src) == WT_EDIT && src->m_atspi) swell_atk_edit_sync(src,true);
+          break;
+          case CBN_SELCHANGE:
+            if (classifyHwnd(src) == WT_COMBO && src->m_atspi)
+              g_signal_emit_by_name((AtkObject *)src->m_atspi,"selection-changed");
+          break;
         }
       }
+      if (classifyHwnd(h) == WT_EDIT && h->m_atspi)
+        swell_atk_edit_sync(h,true); // context-menu cut/paste arrive as WM_COMMAND on the edit
     break;
     case WM_SETTEXT:
       if (h->m_atspi)
@@ -937,12 +1414,36 @@ void swell_atspi_msg_post(HWND h, UINT m, WPARAM w, LPARAM l, LRESULT r)
         switch (classifyHwnd(h))
         {
           case WT_EDIT: // name comes from the label; content changes are AtkText's job
+            swell_atk_edit_sync(h,true);
           break;
           default:
             g_object_notify(G_OBJECT(h->m_atspi),"accessible-name");
           break;
         }
       }
+    break;
+    case WM_KEYDOWN:
+    case WM_CHAR:
+    case WM_LBUTTONDOWN:
+    case WM_LBUTTONUP:
+    case EM_SETSEL:
+    case EM_REPLACESEL:
+      if (classifyHwnd(h) == WT_EDIT && h->m_atspi) swell_atk_edit_sync(h,true);
+    break;
+    case WM_MOUSEMOVE:
+      if (classifyHwnd(h) == WT_EDIT && h->m_atspi && GetCapture() == h)
+        swell_atk_edit_sync(h,true); // drag-selection
+    break;
+    case TBM_SETPOS:
+    case TBM_SETRANGE:
+    case PBM_SETPOS:
+    case PBM_SETRANGE:
+    case PBM_DELTAPOS:
+      if (h->m_atspi) notify_value_changed(h,true);
+    break;
+    case WM_HSCROLL:
+      if (l && classifyHwnd((HWND)l) == WT_TRACKBAR && ((HWND)l)->m_atspi)
+        notify_value_changed((HWND)l,w == SB_ENDSCROLL); // drag stream is throttled
     break;
   }
 }
