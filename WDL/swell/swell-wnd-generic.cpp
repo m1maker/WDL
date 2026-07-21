@@ -41,6 +41,7 @@
 #include "../wdlutf8.h"
 
 #include "swell-dlggen.h"
+#include "swell-atspi-internal.h"
 
 #define EDIT_CURSOR_BLINK_LEN 500
 #define EDIT_CURSOR_CYCLE_INTERVAL 3
@@ -136,6 +137,10 @@ HWND__::HWND__(HWND par, int wID, const RECT *wndr, const char *label, bool visi
      m_menu=NULL;
      m_font=NULL;
      m_oswindow = NULL;
+
+#ifdef SWELL_TARGET_ATSPI
+     m_atspi=NULL;
+#endif
 
 #ifdef SWELL_LICE_GDI
      m_paintctx=0;
@@ -357,8 +362,10 @@ LRESULT SendMessage(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
     
   hwnd->Retain();
 
+  SWELL_ATSPI_MSG_PRE(hwnd,msg,wParam,lParam);
+
   LRESULT ret = wp ? wp(hwnd,msg,wParam,lParam) : 0;
- 
+
   if (msg == WM_DESTROY)
   {
     if (GetCapture()==hwnd) ReleaseCapture(); 
@@ -391,6 +398,7 @@ LRESULT SendMessage(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
     hwnd->m_hashaddestroy=2;
     KillTimer(hwnd,-1);
   }
+  SWELL_ATSPI_MSG_POST(hwnd,msg,wParam,lParam,ret);
   hwnd->Release();
   return ret;
 }
@@ -504,6 +512,7 @@ void EnableWindow(HWND hwnd, int enable)
 
   hwnd->m_enabled=!!enable;
   swell_oswindow_update_enable(hwnd);
+  SWELL_ATSPI_ENABLE(hwnd);
 
   if (!enable)
   {
@@ -1064,8 +1073,10 @@ int GetDlgItemInt(HWND hwnd, int idx, BOOL *translated, int issigned)
 void ShowWindow(HWND hwnd, int cmd)
 {
   if (WDL_NOT_NORMALLY(!hwnd)) return;
- 
-  if (cmd==SW_SHOW||cmd==SW_SHOWNA) 
+
+  const bool atspi_wasvis = hwnd->m_visible;
+
+  if (cmd==SW_SHOW||cmd==SW_SHOWNA)
   {
     if (hwnd->m_visible) cmd = SW_SHOWNA; // do not take focus if already visible
     hwnd->m_visible=true;
@@ -1092,6 +1103,8 @@ void ShowWindow(HWND hwnd, int cmd)
   }
   else if (cmd == SW_RESTORE || cmd == SW_SHOWMAXIMIZED)
     swell_oswindow_maximize(hwnd,cmd == SW_SHOWMAXIMIZED);
+
+  SWELL_ATSPI_SHOWWINDOW(hwnd,atspi_wasvis);
 
   InvalidateRect(hwnd,NULL,FALSE);
 

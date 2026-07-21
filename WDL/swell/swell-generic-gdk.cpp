@@ -41,6 +41,7 @@ extern "C" {
 
 #include "swell-internal.h"
 #include "swell-dlggen.h"
+#include "swell-atspi-internal.h"
 #include "../wdlcstring.h"
 #include "../wdlutf8.h"
 
@@ -227,6 +228,8 @@ static void on_activate(guint32 ftime)
   s_force_window_time = 0;
 
   update_menubar_activations();
+
+  SWELL_ATSPI_APP_ACTIVE(1);
 }
 
 void swell_gdk_reactivate_app(void)
@@ -259,6 +262,8 @@ static void on_deactivate()
   }
   swell_on_toplevel_raise(NULL);
   DestroyPopupMenus();
+
+  SWELL_ATSPI_APP_ACTIVE(0);
 }
 
 void swell_oswindow_destroy(HWND hwnd)
@@ -382,6 +387,8 @@ void SWELL_initargs(int *argc, char ***argv)
       if (pb) s_program_icon_list = g_list_append(s_program_icon_list,pb);
 
       gdk_event_handler_set(swell_gdkEventHandler,NULL,NULL);
+
+      SWELL_ATSPI_INIT();
     }
   }
 }

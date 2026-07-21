@@ -101,7 +101,8 @@ SWELL_OBJS = swell.o swell-ini.o swell-miscdlg-generic.o swell-wnd-generic.o \
              swell-menu-generic.o swell-kb-generic.o swell-dlg-generic.o \
              swell-gdi-generic.o swell-misc-generic.o swell-gdi-lice.o \
              swell-generic-headless.o swell-generic-gdk.o \
-             swell-appstub-generic.o swell-modstub-generic.o 
+             swell-atspi-generic.o \
+             swell-appstub-generic.o swell-modstub-generic.o
 
 LICE_OBJS = lice.o  lice_arc.o lice_colorspace.o lice_line.o lice_text.o \
             lice_textnew.o lice_ico.o lice_bmp.o
@@ -151,6 +152,12 @@ ifndef NOGDK
       LINKEXTRA += -lfontconfig
     endif
   endif
+  ifndef NOATSPI
+    CFLAGS += -DSWELL_TARGET_ATSPI $(shell $(PKG_CONFIG) --cflags atk atk-bridge-2.0)
+    ifndef PRELOAD_GDK
+      LINKEXTRA += $(shell $(PKG_CONFIG) --libs atk atk-bridge-2.0)
+    endif
+  endif
   LINKEXTRA += -lGL
   ifdef PRELOAD_GDK
     CFLAGS += -Wl,-z,lazy
@@ -163,7 +170,7 @@ default: libSwell$(DLL_EXT)
 
 .PHONY: clean 
 
-SWELL_HEADERS=swell-dlggen.h swell-gdi-internalpool.h swell-menugen.h swell-types.h swell-functions.h swell-internal.h
+SWELL_HEADERS=swell-dlggen.h swell-gdi-internalpool.h swell-menugen.h swell-types.h swell-functions.h swell-internal.h swell-atspi-internal.h
 
 swell.o: $(SWELL_HEADERS)
 swell-ini.o: $(SWELL_HEADERS)
@@ -177,6 +184,7 @@ swell-kb-generic.o: $(SWELL_HEADERS)
 swell-miscdlg-generic.o: $(SWELL_HEADERS)
 swell-modstub-generic.o: $(SWELL_HEADERS)
 swell-appstub-generic.o: $(SWELL_HEADERS)
+swell-atspi-generic.o: $(SWELL_HEADERS)
 
 libSwell$(DLL_EXT): $(OBJS)
 	$(CXX) -shared -o $@ $(CFLAGS) $(LFLAGS) $^ $(LINKEXTRA)

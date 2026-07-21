@@ -10,7 +10,8 @@ vpath %.cpp $(WDL_PATH) $(WDL_PATH)/wingui
 SWELL_OBJS = swell.o swell-ini.o swell-miscdlg-generic.o swell-wnd-generic.o \
              swell-menu-generic.o swell-kb-generic.o swell-dlg-generic.o \
              swell-gdi-generic.o swell-misc-generic.o swell-gdi-lice.o \
-             swell-generic-gdk.o swell-appstub-generic.o swell-modstub-generic.o
+             swell-generic-gdk.o swell-atspi-generic.o \
+             swell-appstub-generic.o swell-modstub-generic.o
 
 LICE_OBJS = lice_image.o lice_arc.o lice_line.o lice_text.o \
             lice_textnew.o lice.o lice_colorspace.o
@@ -78,6 +79,11 @@ ifndef NOGDK
       CFLAGS += -DSWELL_FONTCONFIG
       LINKEXTRA += -lfontconfig
     endif
+  endif
+
+  ifndef NOATSPI
+    CFLAGS += -DSWELL_TARGET_ATSPI $(shell $(PKG_CONFIG) --cflags atk atk-bridge-2.0)
+    LINKEXTRA += $(shell $(PKG_CONFIG) --libs atk atk-bridge-2.0)
   endif
 endif
 

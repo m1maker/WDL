@@ -932,6 +932,10 @@ struct HWND__
 
   WDL_StringKeyedArray<void *> m_props;
 
+#ifdef SWELL_TARGET_ATSPI
+  void *m_atspi; // AtkObject wrapper, owned reference, created lazily -- see swell-atspi-generic.cpp
+#endif
+
 #ifdef SWELL_LICE_GDI
   void *m_paintctx; // temporarily set for calls to WM_PAINT
 
