@@ -124,6 +124,18 @@ WDL_DLGRET mainProc(HWND hwndDlg, UINT uMsg, WPARAM wParam, LPARAM lParam)
         TabCtrl_InsertItem(tab,1,&tci);
       }
     return 1;
+    case WM_CONTEXTMENU:
+      {
+        HMENU m = CreatePopupMenu();
+        AddMenuItem(m,0,"First action",40001);
+        AddMenuItem(m,1,"Second action",40002);
+        AddMenuItem(m,2,"Third action",40003);
+        POINT p;
+        GetCursorPos(&p);
+        TrackPopupMenu(m,0,p.x,p.y,0,hwndDlg,NULL);
+        DestroyMenu(m);
+      }
+    return 1;
     case WM_CLOSE:
       DestroyWindow(hwndDlg);
     return 1;

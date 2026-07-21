@@ -58,8 +58,7 @@ AtkObject *swell_atspi_wrapper(HWND h, bool create);
 
 static bool wantWrapper(HWND h)
 {
-  return h && !h->m_hashaddestroy &&
-    (!h->m_classname || strcmp(h->m_classname,"__SWELL_MENU")); // menus get wrapped in a later pass
+  return h && !h->m_hashaddestroy;
 }
 
 static HWND toplevelOf(HWND h)
@@ -83,14 +82,16 @@ enum swellWidgetType {
   WT_LISTBOX,
   WT_LISTVIEW,
   WT_TREEVIEW,
-  WT_TAB
+  WT_TAB,
+  WT_MENU
 };
 
 static int classifyHwnd(HWND h)
 {
   if (!h) return WT_GENERIC;
-  if (!h->m_parent) return WT_TOPLEVEL;
   const char *cn = h->m_classname ? h->m_classname : "";
+  if (!strcmp(cn,"__SWELL_MENU")) return WT_MENU; // parentless, so this must precede the toplevel check
+  if (!h->m_parent) return WT_TOPLEVEL;
   if (!strcmp(cn,"Button"))
   {
     if (h->m_style & BS_GROUPBOX) return WT_GROUPBOX; // SWELL defines this as a high bit, not a low-nibble value
@@ -183,6 +184,7 @@ typedef struct {
   HWND hwnd;         // Retain()ed for the wrapper's lifetime, so the pointer stays valid after destroy
   gchar *name_cache; // owned storage backing get_name()
   GHashTable *item_cache; // virtual items keyed by index+1 or HTREEITEM (containers only)
+  int menu_sel; // last announced menu highlight (menus only)
 } SwellAtkBase;
 typedef struct { AtkObjectClass parent; } SwellAtkBaseClass;
 
@@ -398,6 +400,7 @@ static void swell_atk_base_init(SwellAtkBase *b)
   b->hwnd = NULL;
   b->name_cache = NULL;
   b->item_cache = NULL;
+  b->menu_sel = -1;
 }
 
 /////////////// AtkComponent (geometry, hit testing, focus grab)
@@ -524,6 +527,11 @@ static bool tree_item_valid(HWND h, HTREEITEM it)
   return false;
 }
 
+static HMENU__ *menu_of_hwnd(HWND h)
+{
+  return classifyHwnd(h) == WT_MENU ? (HMENU__ *)GetWindowLongPtr(h,GWLP_USERDATA) : NULL;
+}
+
 static int cont_item_count(HWND h)
 {
   switch (classifyHwnd(h))
@@ -538,6 +546,11 @@ static int cont_item_count(HWND h)
         HTREEITEM r = TreeView_GetRoot(h);
         while (r) { n++; r = TreeView_GetNextSibling(h,r); }
         return n;
+      }
+    case WT_MENU:
+      {
+        HMENU__ *m = menu_of_hwnd(h);
+        return m ? m->items.GetSize() : 0;
       }
   }
   return 0;
@@ -565,6 +578,11 @@ static bool item_is_selected(SwellAtkItem *it)
     case WT_TREEVIEW: return TreeView_GetSelection(h) == it->hti;
     case WT_TAB: return TabCtrl_GetCurSel(h) == it->index;
     case WT_COMBO: return (int)SendMessage(h,CB_GETCURSEL,0,0) == it->index;
+    case WT_MENU:
+      {
+        HMENU__ *m = menu_of_hwnd(h);
+        return m && m->sel_vis == it->index;
+      }
   }
   return false;
 }
@@ -595,6 +613,12 @@ static void item_select(SwellAtkItem *it)
     case WT_COMBO:
       SendMessage(h,CB_SETCURSEL,it->index,0);
       if (h->m_parent) SendMessage(h->m_parent,WM_COMMAND,MAKEWPARAM(h->m_id,CBN_SELCHANGE),(LPARAM)h);
+    break;
+    case WT_MENU:
+      {
+        HMENU__ *m = menu_of_hwnd(h);
+        if (m) { m->sel_vis = it->index; InvalidateRect(h,NULL,FALSE); }
+      }
     break;
   }
 }
@@ -639,6 +663,21 @@ static void item_get_name(SwellAtkItem *it, WDL_FastString *out)
       SendMessage(h,CB_GETLBTEXT,it->index,(LPARAM)buf);
       out->Set(buf);
     break;
+    case WT_MENU:
+      {
+        HMENU__ *m = menu_of_hwnd(h);
+        MENUITEMINFO *inf = m ? m->items.Get(it->index) : NULL;
+        if (inf && inf->dwTypeData && inf->fType != MFT_SEPARATOR)
+        {
+          const char *t = inf->dwTypeData, *tab = strstr(t,"\t");
+          if (tab) out->Set(t,(int)(tab-t));
+          else out->Set(t);
+          gchar *stripped = swell_atspi_strip_accel(out->Get());
+          out->Set(stripped);
+          g_free(stripped);
+        }
+      }
+    break;
   }
 }
 
@@ -669,6 +708,18 @@ static AtkRole swell_atk_item_get_role(AtkObject *o)
   {
     case WT_TREEVIEW: return ATK_ROLE_TREE_ITEM;
     case WT_TAB: return ATK_ROLE_PAGE_TAB;
+    case WT_MENU:
+      {
+        HMENU__ *m = menu_of_hwnd(h);
+        MENUITEMINFO *inf = m ? m->items.Get(it->index) : NULL;
+        if (inf)
+        {
+          if (inf->fType == MFT_SEPARATOR) return ATK_ROLE_SEPARATOR;
+          if (inf->hSubMenu) return ATK_ROLE_MENU;
+          if (inf->fState & MFS_CHECKED) return ATK_ROLE_CHECK_MENU_ITEM;
+        }
+        return ATK_ROLE_MENU_ITEM;
+      }
   }
   return ATK_ROLE_LIST_ITEM;
 }
@@ -687,7 +738,18 @@ static AtkStateSet *swell_atk_item_ref_state_set(AtkObject *o)
   atk_state_set_add_state(ss,ATK_STATE_FOCUSABLE);
   if (h->m_visible) atk_state_set_add_state(ss,ATK_STATE_VISIBLE);
   if (IsWindowVisible(h)) atk_state_set_add_state(ss,ATK_STATE_SHOWING);
-  if (IsWindowEnabled(h))
+  bool enabled = IsWindowEnabled(h);
+  if (enabled && classifyHwnd(h) == WT_MENU)
+  {
+    HMENU__ *m = menu_of_hwnd(h);
+    MENUITEMINFO *inf = m ? m->items.Get(it->index) : NULL;
+    if (inf)
+    {
+      if (inf->fState & MFS_GRAYED) enabled = false;
+      if (inf->fState & MFS_CHECKED) atk_state_set_add_state(ss,ATK_STATE_CHECKED);
+    }
+  }
+  if (enabled)
   {
     atk_state_set_add_state(ss,ATK_STATE_ENABLED);
     atk_state_set_add_state(ss,ATK_STATE_SENSITIVE);
@@ -1508,6 +1570,12 @@ static AtkObject *swell_atk_container_current_item(HWND h)
         const int i = (int)SendMessage(h,CB_GETCURSEL,0,0);
         return i >= 0 ? swell_atk_container_get_item(cont,i,NULL) : NULL;
       }
+    case WT_MENU:
+      {
+        HMENU__ *m = menu_of_hwnd(h);
+        return m && m->sel_vis >= 0 && m->sel_vis < m->items.GetSize() ?
+          swell_atk_container_get_item(cont,m->sel_vis,NULL) : NULL;
+      }
   }
   return NULL;
 }
@@ -1610,6 +1678,7 @@ static AtkRole swell_atk_list_get_role(AtkObject *o)
     case WT_LISTVIEW: return ATK_ROLE_TREE_TABLE;
     case WT_TREEVIEW: return ATK_ROLE_TREE;
     case WT_TAB: return ATK_ROLE_PAGE_TAB_LIST;
+    case WT_MENU: return ATK_ROLE_MENU;
   }
   return ATK_ROLE_INVALID;
 }
@@ -1725,7 +1794,8 @@ AtkObject *swell_atspi_wrapper(HWND h, bool create)
     case WT_LISTBOX:
     case WT_LISTVIEW:
     case WT_TREEVIEW:
-    case WT_TAB: t = SWELL_TYPE_ATK_LIST; break;
+    case WT_TAB:
+    case WT_MENU: t = SWELL_TYPE_ATK_LIST; break;
     default: t = SWELL_TYPE_ATK_BASE; break;
   }
 
@@ -1815,7 +1885,7 @@ static void wrapper_notify_destroyed(HWND h)
 
   if (!h->m_parent)
   {
-    g_signal_emit_by_name(o,"destroy");
+    if (ATK_IS_WINDOW(o)) g_signal_emit_by_name(o,"destroy");
     gint idx = swell_atk_base_get_index_in_parent(o);
     g_signal_emit_by_name(swell_atk_root(),"children-changed::remove",
                           idx >= 0 ? idx : 0, o);
@@ -1857,6 +1927,22 @@ static void notify_radio_group(HWND h)
   }
 }
 
+// announces the highlighted menu item when a menu's sel_vis moved
+static void menu_check_sel(HWND h)
+{
+  AtkObject *o = swell_atspi_wrapper(h,false);
+  HMENU__ *m = menu_of_hwnd(h);
+  if (!o || !m) return;
+  SwellAtkBase *b = SWELL_ATK_BASE(o);
+  if (m->sel_vis == b->menu_sel) return;
+  b->menu_sel = m->sel_vis;
+  if (m->sel_vis >= 0 && m->sel_vis < m->items.GetSize())
+  {
+    AtkObject *item = swell_atk_container_get_item(b,m->sel_vis,NULL);
+    if (item) set_focus_obj(item);
+  }
+}
+
 // PRE/POST pairs are strictly nested, so snapshots live on a small stack
 static struct { HWND h; UINT msg; LRESULT val; } s_snap[16];
 static int s_snap_depth;
@@ -1890,8 +1976,11 @@ void swell_atspi_msg_post(HWND h, UINT m, WPARAM w, LPARAM l, LRESULT r)
         ATSPI_DEBUG("WM_SETFOCUS hwnd=%p class=%s\n",(void*)h,h->m_classname);
         HWND tl = toplevelOf(h);
         if (!wantWrapper(tl) || !wantWrapper(h)) break;
-        AtkObject *frame = swell_atspi_wrapper(tl,true);
-        if (frame) set_active_frame(frame);
+        if (classifyHwnd(tl) != WT_MENU) // menu popups are not frame activations
+        {
+          AtkObject *frame = swell_atspi_wrapper(tl,true);
+          if (frame) set_active_frame(frame);
+        }
         AtkObject *o = swell_atspi_wrapper(h,true);
         AtkObject *item = swell_atk_container_current_item(h);
         set_focus_obj(item ? item : o);
@@ -1967,10 +2056,15 @@ void swell_atspi_msg_post(HWND h, UINT m, WPARAM w, LPARAM l, LRESULT r)
     case EM_SETSEL:
     case EM_REPLACESEL:
       if (classifyHwnd(h) == WT_EDIT && h->m_atspi) swell_atk_edit_sync(h,true);
+      else if (classifyHwnd(h) == WT_MENU) menu_check_sel(h);
     break;
     case WM_MOUSEMOVE:
       if (classifyHwnd(h) == WT_EDIT && h->m_atspi && GetCapture() == h)
         swell_atk_edit_sync(h,true); // drag-selection
+      else if (classifyHwnd(h) == WT_MENU) menu_check_sel(h);
+    break;
+    case WM_PAINT: // menus repaint on every highlight change; cheapest reliable hook
+      if (classifyHwnd(h) == WT_MENU) menu_check_sel(h);
     break;
     case TBM_SETPOS:
     case TBM_SETRANGE:
@@ -2026,7 +2120,7 @@ void swell_atspi_show_window(HWND h, bool wasVisible)
   {
     AtkObject *o = swell_atspi_wrapper(h,true);
     if (!o) return;
-    g_signal_emit_by_name(o,"create");
+    if (ATK_IS_WINDOW(o)) g_signal_emit_by_name(o,"create");
     gint idx = swell_atk_base_get_index_in_parent(o);
     g_signal_emit_by_name(swell_atk_root(),"children-changed::add",
                           idx >= 0 ? idx : 0, o);
@@ -2063,9 +2157,51 @@ void swell_atspi_app_active(int active)
   if (wantWrapper(h)) set_active_frame(swell_atspi_wrapper(h,true));
 }
 
+// AT key event listeners (registered by atk-bridge; enables Orca key echo
+// and the Orca modifier inside SWELL windows)
+struct swellAtkKeyListener { AtkKeySnoopFunc func; gpointer data; guint id; };
+static GArray *s_key_listeners;
+static guint s_key_listener_next_id = 1;
+
+static guint swell_atk_util_add_key_listener(AtkKeySnoopFunc listener, gpointer data)
+{
+  if (!s_key_listeners) s_key_listeners = g_array_new(FALSE,FALSE,sizeof(swellAtkKeyListener));
+  swellAtkKeyListener l = { listener, data, s_key_listener_next_id++ };
+  g_array_append_val(s_key_listeners,l);
+  return l.id;
+}
+
+static void swell_atk_util_remove_key_listener(guint id)
+{
+  if (!s_key_listeners) return;
+  for (guint i = 0; i < s_key_listeners->len; i ++)
+    if (g_array_index(s_key_listeners,swellAtkKeyListener,i).id == id)
+    {
+      g_array_remove_index(s_key_listeners,i);
+      return;
+    }
+}
+
 bool swell_atspi_on_key(void *gdkEventKey)
 {
-  return false; // AT key listener support comes with a later pass
+  if (!s_key_listeners || !s_key_listeners->len) return false;
+  GdkEventKey *k = (GdkEventKey *)gdkEventKey;
+  AtkKeyEventStruct ev;
+  memset(&ev,0,sizeof(ev));
+  ev.type = k->type == GDK_KEY_RELEASE ? ATK_KEY_EVENT_RELEASE : ATK_KEY_EVENT_PRESS;
+  ev.state = k->state;
+  ev.keyval = k->keyval;
+  ev.string = k->string;
+  ev.length = k->length;
+  ev.keycode = k->hardware_keycode;
+  ev.timestamp = k->time;
+  bool consumed = false;
+  for (guint i = 0; i < s_key_listeners->len; i ++)
+  {
+    const swellAtkKeyListener *l = &g_array_index(s_key_listeners,swellAtkKeyListener,i);
+    if (l->func(&ev,l->data)) consumed = true;
+  }
+  return consumed;
 }
 
 /////////////// AtkUtil integration + bridge init
@@ -2097,6 +2233,8 @@ void swell_atspi_init(void)
   uc->get_root = swell_atk_util_get_root;
   uc->get_toolkit_name = swell_atk_util_get_toolkit_name;
   uc->get_toolkit_version = swell_atk_util_get_toolkit_version;
+  uc->add_key_event_listener = swell_atk_util_add_key_listener;
+  uc->remove_key_event_listener = swell_atk_util_remove_key_listener;
 
   const int br = atk_bridge_adaptor_init(NULL,NULL);
   ATSPI_DEBUG("atk_bridge_adaptor_init returned %d, root=%s\n",

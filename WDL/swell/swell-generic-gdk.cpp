@@ -1308,6 +1308,8 @@ static guint swell_gdkComposeKeys(GdkEventKey *k) // return 0 if not in composit
 
 static void OnKeyEvent(GdkEventKey *k)
 {
+  if (SWELL_ATSPI_ON_KEY(k)) return; // consumed by an AT (e.g. Orca modifier)
+
   HWND hwnd = swell_oswindow_to_hwnd(k->window);
   if (!hwnd) return;
 

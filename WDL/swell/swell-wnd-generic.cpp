@@ -8755,7 +8755,9 @@ LRESULT SWELL_SendMouseMessage(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam
   }
 
 
+  SWELL_ATSPI_MSG_PRE(hwnd,msg,wParam,lParam);
   LRESULT ret=hwnd->m_wndproc(hwnd,msg,wParam,lParam);
+  SWELL_ATSPI_MSG_POST(hwnd,msg,wParam,lParam,ret);
 
   if (msg==WM_LBUTTONUP || msg==WM_RBUTTONUP || msg==WM_MOUSEMOVE || msg==WM_MBUTTONUP)
   {
