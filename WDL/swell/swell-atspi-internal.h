@@ -31,7 +31,6 @@
 
 extern bool swell_atspi_active;
 void swell_atspi_init(void);
-void swell_atspi_msg_pre(HWND h, UINT m, WPARAM w, LPARAM l);
 void swell_atspi_msg_post(HWND h, UINT m, WPARAM w, LPARAM l, LRESULT r);
 void swell_atspi_show_window(HWND h, bool wasVisible);
 void swell_atspi_enable_window(HWND h);
@@ -43,9 +42,9 @@ void swell_atspi_get_edit_state(HWND hwnd, int *caret, int *sel1, int *sel2);
 void swell_atspi_set_edit_caret(HWND hwnd, int pos);
 bool swell_atspi_get_tab_text(HWND hwnd, int idx, char *buf, int bufsz);
 int swell_atspi_get_listview_ncols(HWND hwnd);
+bool swell_atspi_get_value_state(HWND hwnd, int *pos, int *lo, int *hi);
 
 #define SWELL_ATSPI_INIT() swell_atspi_init()
-#define SWELL_ATSPI_MSG_PRE(h,m,w,l) do { if (swell_atspi_active) swell_atspi_msg_pre(h,m,w,l); } while(0)
 #define SWELL_ATSPI_MSG_POST(h,m,w,l,r) do { if (swell_atspi_active) swell_atspi_msg_post(h,m,w,l,r); } while(0)
 #define SWELL_ATSPI_SHOWWINDOW(h,wasvis) do { if (swell_atspi_active) swell_atspi_show_window(h,wasvis); } while(0)
 #define SWELL_ATSPI_ENABLE(h) do { if (swell_atspi_active) swell_atspi_enable_window(h); } while(0)
@@ -55,7 +54,6 @@ int swell_atspi_get_listview_ncols(HWND hwnd);
 #else
 
 #define SWELL_ATSPI_INIT() do { } while(0)
-#define SWELL_ATSPI_MSG_PRE(h,m,w,l) do { } while(0)
 #define SWELL_ATSPI_MSG_POST(h,m,w,l,r) do { } while(0)
 #define SWELL_ATSPI_SHOWWINDOW(h,wasvis) do { } while(0)
 #define SWELL_ATSPI_ENABLE(h) do { } while(0)

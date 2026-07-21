@@ -52,9 +52,8 @@ static bool swell_atspi_debug;
 #define ATSPI_DEBUG(...) do { if (swell_atspi_debug) fprintf(stderr,"swell-atspi: " __VA_ARGS__); } while(0)
 
 bool IsModalDialogBox(HWND hwnd); // swell-dlg-generic.cpp
-HWND GetFocusIncludeMenus();      // swell-wnd-generic.cpp
 
-AtkObject *swell_atspi_wrapper(HWND h, bool create);
+static AtkObject *swell_atspi_wrapper(HWND h, bool create);
 
 static bool wantWrapper(HWND h)
 {
@@ -65,6 +64,44 @@ static HWND toplevelOf(HWND h)
 {
   while (h && h->m_parent) h = h->m_parent;
   return h;
+}
+
+// filtered scans over an HWND sibling list (a parent's m_children or SWELL_topwindows)
+static gint count_wrappable(HWND w)
+{
+  gint n = 0;
+  while (w)
+  {
+    if (wantWrapper(w)) n++;
+    w = w->m_next;
+  }
+  return n;
+}
+
+static AtkObject *ref_nth_wrappable(HWND w, gint i)
+{
+  while (w)
+  {
+    if (wantWrapper(w) && i-- == 0)
+    {
+      AtkObject *c = swell_atspi_wrapper(w,true);
+      if (c) g_object_ref(c);
+      return c;
+    }
+    w = w->m_next;
+  }
+  return NULL;
+}
+
+static gint index_of_wrappable(HWND w, HWND h)
+{
+  gint idx = 0;
+  while (w && w != h)
+  {
+    if (wantWrapper(w)) idx++;
+    w = w->m_next;
+  }
+  return w ? idx : -1;
 }
 
 enum swellWidgetType {
@@ -86,11 +123,16 @@ enum swellWidgetType {
   WT_MENU
 };
 
+static bool isMenuHwnd(HWND h)
+{
+  return h->m_classname && !strcmp(h->m_classname,"__SWELL_MENU");
+}
+
 static int classifyHwnd(HWND h)
 {
   if (!h) return WT_GENERIC;
   const char *cn = h->m_classname ? h->m_classname : "";
-  if (!strcmp(cn,"__SWELL_MENU")) return WT_MENU; // parentless, so this must precede the toplevel check
+  if (isMenuHwnd(h)) return WT_MENU; // parentless, so this must precede the toplevel check
   if (!h->m_parent) return WT_TOPLEVEL;
   if (!strcmp(cn,"Button"))
   {
@@ -221,12 +263,8 @@ static AtkRole swell_atk_base_get_role(AtkObject *o)
 {
   HWND h = swell_atk_hwnd(o);
   if (!h) return ATK_ROLE_INVALID;
-  switch (classifyHwnd(h))
-  {
-    case WT_STATIC: return ATK_ROLE_LABEL;
-    case WT_GROUPBOX: return ATK_ROLE_PANEL;
-  }
-  return ATK_ROLE_PANEL;
+  // groupboxes and unclassified controls are all plain panels
+  return classifyHwnd(h) == WT_STATIC ? ATK_ROLE_LABEL : ATK_ROLE_PANEL;
 }
 
 static AtkRelationSet *swell_atk_base_ref_relation_set(AtkObject *o)
@@ -256,8 +294,8 @@ static AtkRelationSet *swell_atk_base_ref_relation_set(AtkObject *o)
 static AtkStateSet *swell_atk_base_ref_state_set(AtkObject *o)
 {
   AtkStateSet *ss = ATK_OBJECT_CLASS(swell_atk_base_parent_class)->ref_state_set(o);
-  HWND h = SWELL_IS_ATK_BASE(o) ? SWELL_ATK_BASE(o)->hwnd : NULL;
-  if (!h || h->m_hashaddestroy)
+  HWND h = swell_atk_hwnd(o);
+  if (!h)
   {
     atk_state_set_add_state(ss,ATK_STATE_DEFUNCT);
     return ss;
@@ -314,57 +352,20 @@ static AtkObject *swell_atk_base_get_parent(AtkObject *o)
 static gint swell_atk_base_get_n_children(AtkObject *o)
 {
   HWND h = swell_atk_hwnd(o);
-  if (!h) return 0;
-  gint n = 0;
-  HWND w = h->m_children;
-  while (w)
-  {
-    if (wantWrapper(w)) n++;
-    w = w->m_next;
-  }
-  return n;
+  return h ? count_wrappable(h->m_children) : 0;
 }
 
 static AtkObject *swell_atk_base_ref_child(AtkObject *o, gint i)
 {
   HWND h = swell_atk_hwnd(o);
-  if (!h) return NULL;
-  HWND w = h->m_children;
-  while (w)
-  {
-    if (wantWrapper(w) && i-- == 0)
-    {
-      AtkObject *c = swell_atspi_wrapper(w,true);
-      if (c) g_object_ref(c);
-      return c;
-    }
-    w = w->m_next;
-  }
-  return NULL;
+  return h ? ref_nth_wrappable(h->m_children,i) : NULL;
 }
 
 static gint swell_atk_base_get_index_in_parent(AtkObject *o)
 {
   HWND h = swell_atk_hwnd(o);
   if (!h) return -1;
-  int idx = 0;
-  if (!h->m_parent)
-  {
-    HWND w = SWELL_topwindows;
-    while (w && w != h)
-    {
-      if (wantWrapper(w)) idx++;
-      w = w->m_next;
-    }
-    return w ? idx : -1;
-  }
-  HWND w = h->m_parent->m_children;
-  while (w && w != h)
-  {
-    if (wantWrapper(w)) idx++;
-    w = w->m_next;
-  }
-  return w ? idx : -1;
+  return index_of_wrappable(h->m_parent ? h->m_parent->m_children : SWELL_topwindows,h);
 }
 
 static void swell_atk_base_finalize(GObject *o)
@@ -505,23 +506,13 @@ typedef struct {
 } SwellAtkItem;
 typedef struct { AtkObjectClass parent; } SwellAtkItemClass;
 
-static bool tree_desc_contains(HTREEITEM par, HTREEITEM needle)
-{
-  for (int i = 0; i < par->m_children.GetSize(); i ++)
-  {
-    HTREEITEM c = par->m_children.Get(i);
-    if (c == needle || tree_desc_contains(c,needle)) return true;
-  }
-  return false;
-}
-
 static bool tree_item_valid(HWND h, HTREEITEM it)
 {
   if (!it) return false;
   HTREEITEM r = TreeView_GetRoot(h);
   while (r)
   {
-    if (r == it || tree_desc_contains(r,it)) return true;
+    if (r == it || r->FindItem(it,NULL,NULL)) return true;
     r = TreeView_GetNextSibling(h,r);
   }
   return false;
@@ -566,9 +557,9 @@ static HWND item_hwnd(SwellAtkItem *it)
   return it->index >= 0 && it->index < cont_item_count(h) ? h : NULL;
 }
 
-static bool item_is_selected(SwellAtkItem *it)
+// h must be the item's already-validated container (item_hwnd(it))
+static bool item_is_selected(HWND h, SwellAtkItem *it)
 {
-  HWND h = item_hwnd(it);
   if (!h) return false;
   switch (classifyHwnd(h))
   {
@@ -623,6 +614,19 @@ static void item_select(SwellAtkItem *it)
   }
 }
 
+// LB_GETTEXT/CB_GETLBTEXT copy unbounded; size the buffer via the *LEN message first
+static void item_text_via_msgs(HWND h, int idx, UINT lenmsg, UINT textmsg, WDL_FastString *out)
+{
+  const int len = (int)SendMessage(h,lenmsg,idx,0);
+  if (len <= 0) return;
+  char *p = (char *)malloc(len + 32);
+  if (!p) return;
+  p[0] = 0;
+  SendMessage(h,textmsg,idx,(LPARAM)p);
+  out->Set(p);
+  free(p);
+}
+
 static void item_get_name(SwellAtkItem *it, WDL_FastString *out)
 {
   out->Set("");
@@ -632,21 +636,7 @@ static void item_get_name(SwellAtkItem *it, WDL_FastString *out)
   switch (classifyHwnd(h))
   {
     case WT_LISTBOX:
-      {
-        // LB_GETTEXT copies unbounded; size the buffer via LB_GETTEXTLEN first
-        const int len = (int)SendMessage(h,LB_GETTEXTLEN,it->index,0);
-        if (len > 0)
-        {
-          char *p = (char *)malloc(len + 32);
-          if (p)
-          {
-            p[0] = 0;
-            SendMessage(h,LB_GETTEXT,it->index,(LPARAM)p);
-            out->Set(p);
-            free(p);
-          }
-        }
-      }
+      item_text_via_msgs(h,it->index,LB_GETTEXTLEN,LB_GETTEXT,out);
     break;
     case WT_LISTVIEW:
       {
@@ -671,21 +661,7 @@ static void item_get_name(SwellAtkItem *it, WDL_FastString *out)
       if (swell_atspi_get_tab_text(h,it->index,buf,sizeof(buf))) out->Set(buf);
     break;
     case WT_COMBO:
-      {
-        // CB_GETLBTEXT copies unbounded; size the buffer via CB_GETLBTEXTLEN first
-        const int len = (int)SendMessage(h,CB_GETLBTEXTLEN,it->index,0);
-        if (len > 0)
-        {
-          char *p = (char *)malloc(len + 32);
-          if (p)
-          {
-            p[0] = 0;
-            SendMessage(h,CB_GETLBTEXT,it->index,(LPARAM)p);
-            out->Set(p);
-            free(p);
-          }
-        }
-      }
+      item_text_via_msgs(h,it->index,CB_GETLBTEXTLEN,CB_GETLBTEXT,out);
     break;
     case WT_MENU:
       {
@@ -778,7 +754,7 @@ static AtkStateSet *swell_atk_item_ref_state_set(AtkObject *o)
     atk_state_set_add_state(ss,ATK_STATE_ENABLED);
     atk_state_set_add_state(ss,ATK_STATE_SENSITIVE);
   }
-  if (item_is_selected(it))
+  if (item_is_selected(h,it))
   {
     atk_state_set_add_state(ss,ATK_STATE_SELECTED);
     if (h == GetFocusIncludeMenus()) atk_state_set_add_state(ss,ATK_STATE_FOCUSED);
@@ -978,7 +954,11 @@ static void swell_atk_toplevel_init(SwellAtkTopLevel *tl) { }
 /////////////// buttons (push/check/radio)
 
 #define SWELL_TYPE_ATK_BUTTON (swell_atk_button_get_type())
-typedef struct { SwellAtkBase parent; } SwellAtkButton;
+#define SWELL_ATK_BUTTON(o) (G_TYPE_CHECK_INSTANCE_CAST((o),SWELL_TYPE_ATK_BUTTON,SwellAtkButton))
+typedef struct {
+  SwellAtkBase parent;
+  int chk_cache; // last reported BM_GETCHECK state, to drop duplicate notifications
+} SwellAtkButton;
 typedef struct { SwellAtkBaseClass parent; } SwellAtkButtonClass;
 
 static gboolean swell_atk_button_do_action(AtkAction *a, gint i)
@@ -1024,7 +1004,10 @@ static void swell_atk_button_class_init(SwellAtkButtonClass *klass)
 {
   ATK_OBJECT_CLASS(klass)->get_role = swell_atk_button_get_role;
 }
-static void swell_atk_button_init(SwellAtkButton *b) { }
+static void swell_atk_button_init(SwellAtkButton *b)
+{
+  b->chk_cache = 0;
+}
 
 /////////////// value controls (trackbar/progress)
 
@@ -1062,16 +1045,13 @@ static void swell_atk_value_init(SwellAtkValue *v)
   v->last_value = -1e300;
 }
 
-// trackbar and progress state share the layout int[0]=pos,
-// int[1]=range packed as MAKELONG(min,max) -- see trackbarWindowProc/progressWindowProc
 static bool swell_atk_value_read(HWND h, double *cur, double *lo, double *hi)
 {
-  const int wt = classifyHwnd(h);
-  if ((wt != WT_TRACKBAR && wt != WT_PROGRESS) || !h->m_private_data) return false;
-  const int *state = (const int *)h->m_private_data;
-  if (cur) *cur = state[0];
-  if (lo) *lo = (short)LOWORD(state[1]);
-  if (hi) *hi = (short)HIWORD(state[1]);
+  int pos, a, b;
+  if (!swell_atspi_get_value_state(h,&pos,&a,&b)) return false;
+  if (cur) *cur = pos;
+  if (lo) *lo = a;
+  if (hi) *hi = b;
   return true;
 }
 
@@ -1119,22 +1099,23 @@ static void swell_atk_value_get_current_value(AtkValue *v, GValue *gv)
   g_value_set_double(gv,d);
 }
 
-static void swell_atk_value_get_maximum_value(AtkValue *v, GValue *gv)
+static void swell_atk_value_get_bound(AtkValue *v, GValue *gv, bool wantmax)
 {
   double lo = 0, hi = 0;
   HWND h = swell_atk_hwnd((AtkObject *)v);
   if (h) swell_atk_value_read(h,NULL,&lo,&hi);
   g_value_init(gv,G_TYPE_DOUBLE);
-  g_value_set_double(gv,hi);
+  g_value_set_double(gv,wantmax ? hi : lo);
+}
+
+static void swell_atk_value_get_maximum_value(AtkValue *v, GValue *gv)
+{
+  swell_atk_value_get_bound(v,gv,true);
 }
 
 static void swell_atk_value_get_minimum_value(AtkValue *v, GValue *gv)
 {
-  double lo = 0, hi = 0;
-  HWND h = swell_atk_hwnd((AtkObject *)v);
-  if (h) swell_atk_value_read(h,NULL,&lo,&hi);
-  g_value_init(gv,G_TYPE_DOUBLE);
-  g_value_set_double(gv,lo);
+  swell_atk_value_get_bound(v,gv,false);
 }
 
 static gboolean swell_atk_value_set_current_value(AtkValue *v, const GValue *gv)
@@ -1236,64 +1217,68 @@ static void swell_atk_edit_read_sel(HWND h, gint *caret, gint *s1, gint *s2)
   *s2 = b;
 }
 
+// emits text-remove/text-insert for the minimal changed middle segment
+static void emit_text_diff(AtkObject *o, const gchar *olds, const gchar *news)
+{
+  const glong oldlen = g_utf8_strlen(olds,-1), newlen = g_utf8_strlen(news,-1);
+  glong pre = 0;
+  const gchar *op = olds, *np = news;
+  while (*op && *np)
+  {
+    if (g_utf8_get_char(op) != g_utf8_get_char(np)) break;
+    op = g_utf8_next_char(op);
+    np = g_utf8_next_char(np);
+    pre++;
+  }
+  glong suf = 0;
+  {
+    const glong maxsuf = wdl_min(oldlen,newlen) - pre;
+    const gchar *oe = olds + strlen(olds), *ne = news + strlen(news);
+    while (suf < maxsuf)
+    {
+      const gchar *po = g_utf8_prev_char(oe), *pn = g_utf8_prev_char(ne);
+      if (g_utf8_get_char(po) != g_utf8_get_char(pn)) break;
+      oe = po; ne = pn;
+      suf++;
+    }
+  }
+  const glong ndel = oldlen - pre - suf, nins = newlen - pre - suf;
+  if (ndel > 0)
+  {
+    gchar *seg = g_utf8_substring(olds,pre,pre+ndel);
+    g_signal_emit_by_name(o,"text-remove",(gint)pre,(gint)ndel,seg);
+    g_free(seg);
+  }
+  if (nins > 0)
+  {
+    gchar *seg = g_utf8_substring(news,pre,pre+nins);
+    g_signal_emit_by_name(o,"text-insert",(gint)pre,(gint)nins,seg);
+    g_free(seg);
+  }
+}
+
 // diffs current state against the wrapper cache and emits text events
 static void swell_atk_edit_sync(HWND h, bool emit)
 {
   AtkObject *o = swell_atspi_wrapper(h,false);
-  if (!o || !SWELL_IS_ATK_BASE(o) || !G_TYPE_CHECK_INSTANCE_TYPE(o,SWELL_TYPE_ATK_EDIT)) return;
+  if (!o || !G_TYPE_CHECK_INSTANCE_TYPE(o,SWELL_TYPE_ATK_EDIT)) return;
   SwellAtkEdit *e = SWELL_ATK_EDIT(o);
 
-  gchar *cur = swell_atk_edit_read_text(h);
-  gint caret, s1, s2;
-  swell_atk_edit_read_sel(h,&caret,&s1,&s2);
-
-  if (e->tcache && strcmp(cur,e->tcache))
+  // this runs per keystroke/mouse event; only allocate a copy once a change
+  // is detected (password text must be re-masked up front to be comparable)
+  gchar *cur = (h->m_style & ES_PASSWORD) ? swell_atk_edit_read_text(h) : NULL;
+  const char *curp = cur ? cur : h->m_title.Get();
+  if (!e->tcache || strcmp(curp,e->tcache))
   {
-    if (emit)
-    {
-      const gchar *olds = e->tcache, *news = cur;
-      const glong oldlen = g_utf8_strlen(olds,-1), newlen = g_utf8_strlen(news,-1);
-      glong pre = 0;
-      const gchar *op = olds, *np = news;
-      while (*op && *np)
-      {
-        if (g_utf8_get_char(op) != g_utf8_get_char(np)) break;
-        op = g_utf8_next_char(op);
-        np = g_utf8_next_char(np);
-        pre++;
-      }
-      glong suf = 0;
-      {
-        const glong maxsuf = wdl_min(oldlen,newlen) - pre;
-        const gchar *oe = olds + strlen(olds), *ne = news + strlen(news);
-        while (suf < maxsuf)
-        {
-          const gchar *po = g_utf8_prev_char(oe), *pn = g_utf8_prev_char(ne);
-          if (g_utf8_get_char(po) != g_utf8_get_char(pn)) break;
-          oe = po; ne = pn;
-          suf++;
-        }
-      }
-      const glong ndel = oldlen - pre - suf, nins = newlen - pre - suf;
-      if (ndel > 0)
-      {
-        gchar *seg = g_utf8_substring(olds,pre,pre+ndel);
-        g_signal_emit_by_name(o,"text-remove",(gint)pre,(gint)ndel,seg);
-        g_free(seg);
-      }
-      if (nins > 0)
-      {
-        gchar *seg = g_utf8_substring(news,pre,pre+nins);
-        g_signal_emit_by_name(o,"text-insert",(gint)pre,(gint)nins,seg);
-        g_free(seg);
-      }
-    }
+    if (!cur) cur = g_strdup(curp);
+    if (emit && e->tcache) emit_text_diff(o,e->tcache,cur);
     g_free(e->tcache);
     e->tcache = cur;
   }
-  else if (!e->tcache) e->tcache = cur;
   else g_free(cur);
 
+  gint caret, s1, s2;
+  swell_atk_edit_read_sel(h,&caret,&s1,&s2);
   if (caret != e->ccaret)
   {
     e->ccaret = caret;
@@ -1538,8 +1523,6 @@ static void swell_atk_editable_text_iface_init(AtkEditableTextIface *iface)
   iface->delete_text = swell_atk_edtext_delete_text;
 }
 
-/////////////// combo boxes
-
 /////////////// shared container child/selection plumbing (list-likes + combo)
 
 static gint swell_atk_container_get_n_children(AtkObject *o)
@@ -1645,7 +1628,7 @@ static gboolean swell_atk_sel_is_child_selected(AtkSelection *s, gint i)
   if (!h || i < 0 || i >= cont_item_count(h)) return FALSE;
   AtkObject *c = swell_atk_container_ref_child((AtkObject *)s,i);
   if (!c) return FALSE;
-  const gboolean r = item_is_selected(SWELL_ATK_ITEM(c));
+  const gboolean r = item_is_selected(h,SWELL_ATK_ITEM(c));
   g_object_unref(c);
   return r;
 }
@@ -1667,30 +1650,7 @@ static void swell_atk_selection_iface_init(AtkSelectionIface *iface)
   iface->add_selection = swell_atk_sel_add_selection;
 }
 
-/////////////// combo boxes
-
-#define SWELL_TYPE_ATK_COMBO (swell_atk_combo_get_type())
-typedef struct { SwellAtkBase parent; } SwellAtkCombo;
-typedef struct { SwellAtkBaseClass parent; } SwellAtkComboClass;
-
-G_DEFINE_TYPE_WITH_CODE(SwellAtkCombo, swell_atk_combo, SWELL_TYPE_ATK_BASE,
-    G_IMPLEMENT_INTERFACE(ATK_TYPE_SELECTION, swell_atk_selection_iface_init))
-
-static AtkRole swell_atk_combo_get_role(AtkObject *o)
-{
-  return swell_atk_hwnd(o) ? ATK_ROLE_COMBO_BOX : ATK_ROLE_INVALID;
-}
-
-static void swell_atk_combo_class_init(SwellAtkComboClass *klass)
-{
-  AtkObjectClass *oc = ATK_OBJECT_CLASS(klass);
-  oc->get_role = swell_atk_combo_get_role;
-  oc->get_n_children = swell_atk_container_get_n_children;
-  oc->ref_child = swell_atk_container_ref_child;
-}
-static void swell_atk_combo_init(SwellAtkCombo *c) { }
-
-/////////////// list-like controls (listbox/listview/treeview/tab)
+/////////////// item containers (listbox/listview/treeview/tab/combo/menu)
 
 #define SWELL_TYPE_ATK_LIST (swell_atk_list_get_type())
 typedef struct { SwellAtkBase parent; } SwellAtkList;
@@ -1707,6 +1667,7 @@ static AtkRole swell_atk_list_get_role(AtkObject *o)
     case WT_LISTVIEW: return ATK_ROLE_TREE_TABLE;
     case WT_TREEVIEW: return ATK_ROLE_TREE;
     case WT_TAB: return ATK_ROLE_PAGE_TAB_LIST;
+    case WT_COMBO: return ATK_ROLE_COMBO_BOX;
     case WT_MENU: return ATK_ROLE_MENU;
   }
   return ATK_ROLE_INVALID;
@@ -1754,30 +1715,12 @@ static const gchar *swell_atk_root_get_name(AtkObject *o)
 
 static gint swell_atk_root_get_n_children(AtkObject *o)
 {
-  gint n = 0;
-  HWND w = SWELL_topwindows;
-  while (w)
-  {
-    if (wantWrapper(w)) n++;
-    w = w->m_next;
-  }
-  return n;
+  return count_wrappable(SWELL_topwindows);
 }
 
 static AtkObject *swell_atk_root_ref_child(AtkObject *o, gint i)
 {
-  HWND w = SWELL_topwindows;
-  while (w)
-  {
-    if (wantWrapper(w) && i-- == 0)
-    {
-      AtkObject *c = swell_atspi_wrapper(w,true);
-      if (c) g_object_ref(c);
-      return c;
-    }
-    w = w->m_next;
-  }
-  return NULL;
+  return ref_nth_wrappable(SWELL_topwindows,i);
 }
 
 static void swell_atk_root_obj_class_init(SwellAtkRootClass *klass)
@@ -1803,7 +1746,7 @@ static AtkObject *swell_atk_root(void)
 
 /////////////// wrapper management
 
-AtkObject *swell_atspi_wrapper(HWND h, bool create)
+static AtkObject *swell_atspi_wrapper(HWND h, bool create)
 {
   if (!h) return NULL;
   if (h->m_atspi) return (AtkObject *)h->m_atspi;
@@ -1819,7 +1762,7 @@ AtkObject *swell_atspi_wrapper(HWND h, bool create)
     case WT_TRACKBAR:
     case WT_PROGRESS: t = SWELL_TYPE_ATK_VALUE; break;
     case WT_EDIT: t = SWELL_TYPE_ATK_EDIT; break;
-    case WT_COMBO: t = SWELL_TYPE_ATK_COMBO; break;
+    case WT_COMBO:
     case WT_LISTBOX:
     case WT_LISTVIEW:
     case WT_TREEVIEW:
@@ -1832,7 +1775,10 @@ AtkObject *swell_atspi_wrapper(HWND h, bool create)
   h->Retain();
   b->hwnd = h;
   h->m_atspi = b;
-  if (t == SWELL_TYPE_ATK_EDIT) swell_atk_edit_sync(h,false); // seed the text cache silently
+  // seed change-detection caches silently
+  if (t == SWELL_TYPE_ATK_EDIT) swell_atk_edit_sync(h,false);
+  else if (t == SWELL_TYPE_ATK_BUTTON)
+    ((SwellAtkButton *)b)->chk_cache = (int)SendMessage(h,BM_GETCHECK,0,0);
   return (AtkObject *)b;
 }
 
@@ -1940,11 +1886,16 @@ static void wrapper_notify_destroyed(HWND h)
 
 /////////////// hooks called from swell-wnd-generic.cpp / swell-generic-gdk.cpp
 
+// compare-and-emit against the wrapper's last-reported state, so callers can
+// invoke this on any suspicion of change (same idiom as the edit/value caches)
 static void notify_check_state(HWND h)
 {
   AtkObject *o = swell_atspi_wrapper(h,false);
-  if (!o) return;
-  const LRESULT chk = SendMessage(h,BM_GETCHECK,0,0);
+  if (!o || !G_TYPE_CHECK_INSTANCE_TYPE(o,SWELL_TYPE_ATK_BUTTON)) return;
+  SwellAtkButton *b = SWELL_ATK_BUTTON(o);
+  const int chk = (int)SendMessage(h,BM_GETCHECK,0,0);
+  if (chk == b->chk_cache) return;
+  b->chk_cache = chk;
   atk_object_notify_state_change(o,ATK_STATE_CHECKED,chk == 1);
   if (classifyHwnd(h) == WT_CHECKBOX)
     atk_object_notify_state_change(o,ATK_STATE_INDETERMINATE,chk == 2);
@@ -1998,32 +1949,25 @@ static void menu_check_sel(HWND h)
   }
 }
 
-// PRE/POST pairs are strictly nested, so snapshots live on a small stack
-static struct { HWND h; UINT msg; LRESULT val; } s_snap[16];
-static int s_snap_depth;
-
-void swell_atspi_msg_pre(HWND h, UINT m, WPARAM w, LPARAM l)
+// announces a container's new current item: a focus event if the container is
+// focused, otherwise a selected-state event
+static void notify_container_sel_changed(HWND src)
 {
-  switch (m)
-  {
-    case BM_SETCHECK:
-      {
-        const int wt = classifyHwnd(h);
-        if ((wt == WT_CHECKBOX || wt == WT_RADIO) && h->m_atspi &&
-            s_snap_depth < (int) (sizeof(s_snap)/sizeof(s_snap[0])))
-        {
-          s_snap[s_snap_depth].h = h;
-          s_snap[s_snap_depth].msg = m;
-          s_snap[s_snap_depth].val = SendMessage(h,BM_GETCHECK,0,0);
-          s_snap_depth++;
-        }
-      }
-    break;
-  }
+  if (!src->m_atspi) return;
+  g_signal_emit_by_name((AtkObject *)src->m_atspi,"selection-changed");
+  AtkObject *item = swell_atk_container_current_item(src);
+  if (!item) return;
+  if (src == GetFocusIncludeMenus()) set_focus_obj(item);
+  else atk_object_notify_state_change(item,ATK_STATE_SELECTED,TRUE);
 }
 
 void swell_atspi_msg_post(HWND h, UINT m, WPARAM w, LPARAM l, LRESULT r)
 {
+  // menu highlight moves are driven by mouse, keys, timers and delegate
+  // messages; polling sel_vis on any message beats enumerating those paths
+  // (menu paints bypass SendMessage entirely, so WM_PAINT is not an option)
+  if (h->m_atspi && isMenuHwnd(h)) menu_check_sel(h);
+
   switch (m)
   {
     case WM_SETFOCUS:
@@ -2050,44 +1994,39 @@ void swell_atspi_msg_post(HWND h, UINT m, WPARAM w, LPARAM l, LRESULT r)
       if (h->m_hashaddestroy == 2) wrapper_notify_destroyed(h);
     break;
     case BM_SETCHECK:
-      if (s_snap_depth > 0 && s_snap[s_snap_depth-1].h == h && s_snap[s_snap_depth-1].msg == m)
-      {
-        s_snap_depth--;
-        if (SendMessage(h,BM_GETCHECK,0,0) != s_snap[s_snap_depth].val)
-          notify_check_state(h);
-      }
+      notify_check_state(h);
     break;
     case WM_COMMAND:
-      if (l && is_descendant_hwnd(h,(HWND)l))
       {
-        HWND src = (HWND)l;
-        switch (HIWORD(w))
+        // check the notification code before is_descendant_hwnd: the walk is
+        // O(subtree) and this runs for every WM_COMMAND in the app
+        const int code = HIWORD(w);
+        if (l && (code == BN_CLICKED || code == EN_CHANGE || code == CBN_SELCHANGE) &&
+            is_descendant_hwnd(h,(HWND)l))
         {
-          case BN_CLICKED:
-            switch (classifyHwnd(src))
-            {
-              case WT_CHECKBOX: notify_check_state(src); break;
-              case WT_RADIO: notify_radio_group(src); break;
-            }
-          break;
-          case EN_CHANGE:
-            if (classifyHwnd(src) == WT_EDIT && src->m_atspi) swell_atk_edit_sync(src,true);
-          break;
-          case CBN_SELCHANGE: // note: LBN_SELCHANGE has the same value; distinguish by class
-            {
-              const int swt = classifyHwnd(src);
-              if ((swt == WT_COMBO || swt == WT_LISTBOX) && src->m_atspi)
+          HWND src = (HWND)l;
+          switch (code)
+          {
+            case BN_CLICKED:
+              switch (classifyHwnd(src))
               {
-                g_signal_emit_by_name((AtkObject *)src->m_atspi,"selection-changed");
-                AtkObject *item = swell_atk_container_current_item(src);
-                if (item && src == GetFocusIncludeMenus()) set_focus_obj(item);
-                else if (item) atk_object_notify_state_change(item,ATK_STATE_SELECTED,TRUE);
+                case WT_CHECKBOX: notify_check_state(src); break;
+                case WT_RADIO: notify_radio_group(src); break;
               }
-            }
-          break;
+            break;
+            case EN_CHANGE:
+              if (src->m_atspi) swell_atk_edit_sync(src,true);
+            break;
+            case CBN_SELCHANGE: // note: LBN_SELCHANGE has the same value; distinguish by class
+              {
+                const int swt = classifyHwnd(src);
+                if (swt == WT_COMBO || swt == WT_LISTBOX) notify_container_sel_changed(src);
+              }
+            break;
+          }
         }
       }
-      if (classifyHwnd(h) == WT_EDIT && h->m_atspi)
+      if (h->m_atspi)
         swell_atk_edit_sync(h,true); // context-menu cut/paste arrive as WM_COMMAND on the edit
     break;
     case WM_SETTEXT:
@@ -2110,16 +2049,11 @@ void swell_atspi_msg_post(HWND h, UINT m, WPARAM w, LPARAM l, LRESULT r)
     case WM_LBUTTONUP:
     case EM_SETSEL:
     case EM_REPLACESEL:
-      if (classifyHwnd(h) == WT_EDIT && h->m_atspi) swell_atk_edit_sync(h,true);
-      else if (classifyHwnd(h) == WT_MENU) menu_check_sel(h);
+      if (h->m_atspi) swell_atk_edit_sync(h,true); // no-op for non-edit wrappers
     break;
     case WM_MOUSEMOVE:
-      if (classifyHwnd(h) == WT_EDIT && h->m_atspi && GetCapture() == h)
+      if (h->m_atspi && GetCapture() == h)
         swell_atk_edit_sync(h,true); // drag-selection
-      else if (classifyHwnd(h) == WT_MENU) menu_check_sel(h);
-    break;
-    case WM_PAINT: // menus repaint on every highlight change; cheapest reliable hook
-      if (classifyHwnd(h) == WT_MENU) menu_check_sel(h);
     break;
     case TBM_SETPOS:
     case TBM_SETRANGE:
@@ -2129,27 +2063,22 @@ void swell_atspi_msg_post(HWND h, UINT m, WPARAM w, LPARAM l, LRESULT r)
       if (h->m_atspi) notify_value_changed(h,true);
     break;
     case WM_HSCROLL:
-      if (l && is_descendant_hwnd(h,(HWND)l) &&
-          classifyHwnd((HWND)l) == WT_TRACKBAR && ((HWND)l)->m_atspi)
+      if (l && is_descendant_hwnd(h,(HWND)l) && ((HWND)l)->m_atspi)
         notify_value_changed((HWND)l,w == SB_ENDSCROLL); // drag stream is throttled
     break;
     case WM_NOTIFY:
       {
+        // check the code before is_descendant_hwnd: listview-heavy hosts send
+        // torrents of WM_NOTIFY and the walk is O(subtree)
         NMHDR *nm = (NMHDR *)l;
-        if (!nm || !nm->hwndFrom || !is_descendant_hwnd(h,nm->hwndFrom) ||
-            !nm->hwndFrom->m_atspi) break;
-        HWND src = nm->hwndFrom;
+        if (!nm || !nm->hwndFrom) break;
         switch (nm->code)
         {
           case LVN_ITEMCHANGED:
           case TVN_SELCHANGED:
           case TCN_SELCHANGE:
-            {
-              g_signal_emit_by_name((AtkObject *)src->m_atspi,"selection-changed");
-              AtkObject *item = swell_atk_container_current_item(src);
-              if (item && src == GetFocusIncludeMenus()) set_focus_obj(item);
-              else if (item) atk_object_notify_state_change(item,ATK_STATE_SELECTED,TRUE);
-            }
+            if (is_descendant_hwnd(h,nm->hwndFrom))
+              notify_container_sel_changed(nm->hwndFrom);
           break;
         }
       }

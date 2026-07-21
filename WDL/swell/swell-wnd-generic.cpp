@@ -362,8 +362,6 @@ LRESULT SendMessage(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
     
   hwnd->Retain();
 
-  SWELL_ATSPI_MSG_PRE(hwnd,msg,wParam,lParam);
-
   LRESULT ret = wp ? wp(hwnd,msg,wParam,lParam) : 0;
 
   if (msg == WM_DESTROY)
@@ -8755,7 +8753,6 @@ LRESULT SWELL_SendMouseMessage(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam
   }
 
 
-  SWELL_ATSPI_MSG_PRE(hwnd,msg,wParam,lParam);
   LRESULT ret=hwnd->m_wndproc(hwnd,msg,wParam,lParam);
   SWELL_ATSPI_MSG_POST(hwnd,msg,wParam,lParam,ret);
 
@@ -8773,13 +8770,21 @@ LRESULT SWELL_SendMouseMessage(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam
 #ifdef SWELL_TARGET_ATSPI
 // private-state accessors for the accessibility bridge (swell-atspi-generic.cpp) --
 // these expose control internals that have no public message-based read-back
+
+// m_private_data if hwnd is a live window of class cls, otherwise NULL
+static void *atspi_class_state(HWND hwnd, const char *cls)
+{
+  if (!hwnd || !hwnd->m_private_data || !hwnd->m_classname || strcmp(hwnd->m_classname,cls)) return NULL;
+  return (void *)hwnd->m_private_data;
+}
+
 void swell_atspi_get_edit_state(HWND hwnd, int *caret, int *sel1, int *sel2)
 {
   if (caret) *caret = -1;
   if (sel1) *sel1 = -1;
   if (sel2) *sel2 = -1;
-  if (!hwnd || !hwnd->m_private_data || !hwnd->m_classname || strcmp(hwnd->m_classname,"Edit")) return;
-  const __SWELL_editControlState *es = (const __SWELL_editControlState *)hwnd->m_private_data;
+  const __SWELL_editControlState *es = (const __SWELL_editControlState *)atspi_class_state(hwnd,"Edit");
+  if (!es) return;
   if (caret) *caret = es->cursor_pos; // character position, not bytes
   if (sel1) *sel1 = es->sel1;
   if (sel2) *sel2 = es->sel2;
@@ -8788,9 +8793,8 @@ void swell_atspi_get_edit_state(HWND hwnd, int *caret, int *sel1, int *sel2)
 bool swell_atspi_get_tab_text(HWND hwnd, int idx, char *buf, int bufsz)
 {
   if (buf && bufsz > 0) *buf = 0;
-  if (!hwnd || !hwnd->m_private_data || !hwnd->m_classname || strcmp(hwnd->m_classname,"SysTabControl32")) return false;
-  const tabControlState *s = (const tabControlState *)hwnd->m_private_data;
-  const char *t = s->m_tabs.Get(idx);
+  const tabControlState *s = (const tabControlState *)atspi_class_state(hwnd,"SysTabControl32");
+  const char *t = s ? s->m_tabs.Get(idx) : NULL;
   if (!t) return false;
   if (buf) lstrcpyn_safe(buf,t,bufsz);
   return true;
@@ -8798,17 +8802,16 @@ bool swell_atspi_get_tab_text(HWND hwnd, int idx, char *buf, int bufsz)
 
 int swell_atspi_get_listview_ncols(HWND hwnd)
 {
-  if (!hwnd || !hwnd->m_private_data || !hwnd->m_classname || strcmp(hwnd->m_classname,"SysListView32")) return 0;
-  const listViewState *lvs = (const listViewState *)hwnd->m_private_data;
-  return lvs->m_cols.GetSize();
+  const listViewState *lvs = (const listViewState *)atspi_class_state(hwnd,"SysListView32");
+  return lvs ? lvs->m_cols.GetSize() : 0;
 }
 
 void swell_atspi_set_edit_caret(HWND hwnd, int pos)
 {
   // EM_SETSEL only adjusts the selection; the caret used for typing and
   // reported by swell_atspi_get_edit_state is cursor_pos
-  if (!hwnd || !hwnd->m_private_data || !hwnd->m_classname || strcmp(hwnd->m_classname,"Edit")) return;
-  __SWELL_editControlState *es = (__SWELL_editControlState *)hwnd->m_private_data;
+  __SWELL_editControlState *es = (__SWELL_editControlState *)atspi_class_state(hwnd,"Edit");
+  if (!es) return;
   const int len = WDL_utf8_get_charlen(hwnd->m_title.Get());
   if (pos < 0) pos = 0;
   if (pos > len) pos = len;
@@ -8816,6 +8819,20 @@ void swell_atspi_set_edit_caret(HWND hwnd, int pos)
   es->autoScrollToOffset(hwnd,pos,(hwnd->m_style & ES_MULTILINE) != 0,
       (hwnd->m_style & (ES_MULTILINE|ES_AUTOHSCROLL)) == ES_MULTILINE);
   InvalidateRect(hwnd,NULL,FALSE);
+}
+
+bool swell_atspi_get_value_state(HWND hwnd, int *pos, int *lo, int *hi)
+{
+  // trackbar and progress state share the layout int[0]=pos,
+  // int[1]=range packed as MAKELONG(min,max) -- see trackbarWindowProc/progressWindowProc
+  const int *state = (const int *)atspi_class_state(hwnd,"msctls_trackbar32");
+  if (!state) state = (const int *)atspi_class_state(hwnd,"REAPERhfader");
+  if (!state) state = (const int *)atspi_class_state(hwnd,"msctls_progress32");
+  if (!state) return false;
+  if (pos) *pos = state[0];
+  if (lo) *lo = (short)LOWORD(state[1]);
+  if (hi) *hi = (short)HIWORD(state[1]);
+  return true;
 }
 #endif
 
