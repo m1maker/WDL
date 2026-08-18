@@ -1253,8 +1253,9 @@ static bool m_sizetofits;
 
 void SWELL_MakeSetCurParms(float xscale, float yscale, float xtrans, float ytrans, HWND parent, bool doauto, bool dosizetofit)
 {
-  if (xscale == 0.0f) xscale = 1.0f;
-  if (yscale == 0.0f) yscale = 1.0f;
+  if (xscale == 0.0) xscale = SWELL_DEF_DLGSCALE2;
+  if (yscale == 0.0) yscale = SWELL_DEF_DLGSCALE2;
+
   if (g_swell_ui_scale != 256 && xscale != 1.0f && yscale != 1.0f)
   {
     const float m = g_swell_ui_scale/256.0f;
@@ -8166,7 +8167,7 @@ LRESULT DefWindowProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
         if (dc)
         {
           if (!menubar_font) 
-            menubar_font = CreateFont(g_swell_ctheme.menubar_font_size,0,0,0,FW_NORMAL,0,0,0,0,0,0,0,0,g_swell_deffont_face);
+            menubar_font = CreateFont(-wdl_abs(g_swell_ctheme.menubar_font_size),0,0,0,FW_NORMAL,0,0,0,0,0,0,0,0,g_swell_deffont_face);
 
           RECT r;
           GetWindowContentViewRect(hwnd,&r);
